@@ -14,6 +14,7 @@
 
 """HTTP liveness and readiness probes for network transports."""
 
+# pyrefly: ignore [missing-import]
 from fastmcp import FastMCP
 from starlette.requests import Request
 from starlette.responses import JSONResponse, Response
