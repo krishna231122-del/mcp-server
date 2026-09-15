@@ -16,6 +16,8 @@
 
 from __future__ import annotations
 
+from unittest.mock import patch
+
 import pytest
 from tests.common import FAILED, SUCCESS, TestCase, assert_test_case
 
@@ -97,30 +99,38 @@ def test_validate_namespace_delegates():
     assert err is not None
 
 
-from unittest.mock import patch
-
 @patch("kubeflow_mcp.core.policy.get_allowed_namespaces", return_value={"default", "kube-system"})
 def test_check_namespace_allowed_with_policy_allowing(mock_get_allowed):
     from kubeflow_mcp.core.security import check_namespace_allowed
+
     assert check_namespace_allowed("default") is None
+
 
 @patch("kubeflow_mcp.core.policy.get_allowed_namespaces", return_value={"default"})
 def test_check_namespace_allowed_with_policy_denying(mock_get_allowed):
     from kubeflow_mcp.core.security import check_namespace_allowed
+
     err = check_namespace_allowed("kube-system")
     assert err is not None
     assert "not allowed by policy" in err.error
+
 
 @patch("kubeflow_mcp.common.utils.get_trainer_effective_namespace", return_value="kubeflow")
 @patch("kubeflow_mcp.core.policy.get_allowed_namespaces", return_value={"kubeflow"})
 def test_check_namespace_allowed_with_none_resolving_to_default(mock_get_allowed, mock_get_eff):
     from kubeflow_mcp.core.security import check_namespace_allowed
+
     assert check_namespace_allowed(None) is None
 
-@patch("kubeflow_mcp.common.utils.get_trainer_effective_namespace", side_effect=Exception("Failed to load kubeconfig"))
+
+@patch(
+    "kubeflow_mcp.common.utils.get_trainer_effective_namespace",
+    side_effect=Exception("Failed to load kubeconfig"),
+)
 @patch("kubeflow_mcp.core.policy.get_allowed_namespaces", return_value={"kubeflow"})
 def test_check_namespace_allowed_fail_closed_on_resolution_error(mock_get_allowed, mock_get_eff):
     from kubeflow_mcp.core.security import check_namespace_allowed
+
     err = check_namespace_allowed(None)
     assert err is not None
     assert "Cannot resolve effective namespace" in err.error
@@ -355,8 +365,8 @@ def test_validate_training_bounds(test_case):
             expected_output="__subclasses__",
         ),
         TestCase(
-            name="getattr bypass is NOT caught",
-            expected_status=SUCCESS,
+            name="getattr bypass is caught",
+            expected_status=FAILED,
             config={"code": "getattr(__builtins__, 'ev' + 'al')('1+1')"},
         ),
     ],
@@ -412,11 +422,19 @@ def test_is_safe_python_code(test_case):
         ),
         TestCase(
             name="masks _SENSITIVE_EXACT keys",
-            config={"data": {"s3_secret_access_key": "x"}, "key": "s3_secret_access_key", "expected": "***"},
+            config={
+                "data": {"s3_secret_access_key": "x"},
+                "key": "s3_secret_access_key",
+                "expected": "***",
+            },
         ),
         TestCase(
             name="masks _SENSITIVE_SUBSTRINGS",
-            config={"data": {"my_kubeconfig_path": "x"}, "key": "my_kubeconfig_path", "expected": "***"},
+            config={
+                "data": {"my_kubeconfig_path": "x"},
+                "key": "my_kubeconfig_path",
+                "expected": "***",
+            },
         ),
         TestCase(
             name="preserves _SAFE_KEYS",
