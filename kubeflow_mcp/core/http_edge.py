@@ -25,6 +25,7 @@ def register_probe_routes(
     is_ready: bool = True,
     clients: list[str] | None = None,
     auth_type: str | None = None,
+    transport: str | None = None,
 ) -> None:
     """Register unauthenticated probes and discovery on the FastMCP HTTP application."""
     from kubeflow_mcp import __version__
@@ -41,11 +42,16 @@ def register_probe_routes(
 
     @mcp.custom_route("/.well-known/mcp.json", methods=["GET"], include_in_schema=False)
     async def mcp_card(_request: Request) -> Response:
+        card_transports = (
+            [{"type": "sse", "url": "/sse"}]
+            if transport == "sse"
+            else [{"type": "streamable-http", "url": "/mcp"}]
+        )
         card = {
             "name": "kubeflow-mcp",
             "version": __version__,
             "description": "Kubeflow MCP Server",
-            "transports": [{"type": "streamable-http", "url": "/mcp"}],
+            "transports": card_transports,
             "capabilities": {"tools": True, "resources": True, "prompts": False},
             "clients": clients or [],
         }
