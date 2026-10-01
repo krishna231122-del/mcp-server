@@ -401,7 +401,17 @@ def mask_sensitive_data(data: dict[str, Any]) -> dict[str, Any]:
         elif isinstance(v, dict):
             result[k] = mask_sensitive_data(v)
         elif isinstance(v, list):
-            result[k] = [mask_sensitive_data(i) if isinstance(i, dict) else i for i in v]
+            def _mask_list(lst: list) -> list:
+                masked = []
+                for item in lst:
+                    if isinstance(item, dict):
+                        masked.append(mask_sensitive_data(item))
+                    elif isinstance(item, list):
+                        masked.append(_mask_list(item))
+                    else:
+                        masked.append(item)
+                return masked
+            result[k] = _mask_list(v)
         else:
             result[k] = v
 
