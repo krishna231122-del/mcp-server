@@ -48,7 +48,7 @@ class TestAPIKeyVerifier:
     async def test_timing_safe_comparison(self, mock_compare):
         verifier = APIKeyVerifier(expected_token="test-secret")
         await verifier.verify_token("test-secret")
-        mock_compare.assert_called_once_with("test-secret", "test-secret")
+        mock_compare.assert_called_once_with(b"test-secret", b"test-secret")
 
 
 class TestBuildAuthProvider:
@@ -64,19 +64,18 @@ class TestBuildAuthProvider:
     def test_returns_jwt_verifier(self):
         config = AuthConfig(jwks_uri="https://example.com/jwks.json")
         provider = build_auth_provider(config)
-        
+
         from fastmcp.server.auth.providers.jwt import JWTVerifier
+
         assert isinstance(provider, JWTVerifier)
         assert provider.jwks_uri == "https://example.com/jwks.json"
 
     def test_jwks_uri_takes_precedence(self):
-        config = AuthConfig(
-            auth_token="my-token",
-            jwks_uri="https://example.com/jwks.json"
-        )
+        config = AuthConfig(auth_token="my-token", jwks_uri="https://example.com/jwks.json")
         provider = build_auth_provider(config)
-        
+
         from fastmcp.server.auth.providers.jwt import JWTVerifier
+
         assert isinstance(provider, JWTVerifier)
 
 
