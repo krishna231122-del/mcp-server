@@ -150,9 +150,6 @@ _DANGEROUS_CALLS = frozenset(
         "__import__",
         "compile",
         "execfile",
-        "getattr",
-        "setattr",
-        "delattr",
     }
 )
 _DANGEROUS_ATTR_CALLS = {
@@ -185,8 +182,17 @@ class _ScriptSafetyVisitor(ast.NodeVisitor):
         self.warnings: list[str] = []
 
     def visit_Call(self, node: ast.Call) -> None:  # noqa: N802
-        if isinstance(node.func, ast.Name) and node.func.id in _DANGEROUS_CALLS:
-            self.warnings.append(f"Dangerous call: {node.func.id}() at line {node.lineno}")
+        if isinstance(node.func, ast.Name):
+            if node.func.id in _DANGEROUS_CALLS:
+                self.warnings.append(f"Dangerous call: {node.func.id}() at line {node.lineno}")
+            elif node.func.id in {"getattr", "setattr", "delattr"}:
+                if len(node.args) >= 2:
+                    attr_arg = node.args[1]
+                    if isinstance(attr_arg, ast.Constant) and isinstance(attr_arg.value, str):
+                        if attr_arg.value in _DANGEROUS_DUNDER:
+                            self.warnings.append(
+                                f"Dangerous call: {node.func.id}() at line {node.lineno}"
+                            )
         elif isinstance(node.func, ast.Attribute):
             if isinstance(node.func.value, ast.Name):
                 module = node.func.value.id
