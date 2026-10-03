@@ -16,6 +16,10 @@
 
 from __future__ import annotations
 
+from unittest.mock import patch
+
+from fastmcp.server.auth.providers.jwt import JWTVerifier
+
 from kubeflow_mcp.core.auth import APIKeyVerifier, AuthContext, build_auth_provider
 from kubeflow_mcp.core.config import AuthConfig
 
@@ -58,8 +62,6 @@ class TestAPIKeyVerifier:
         result = await verifier.verify_token("")
         assert result is None
 
-    from unittest.mock import patch
-
     @patch("hmac.compare_digest", return_value=True)
     async def test_timing_safe_comparison(self, mock_compare):
         verifier = APIKeyVerifier(expected_token="test-secret")
@@ -81,16 +83,12 @@ class TestBuildAuthProvider:
         config = AuthConfig(jwks_uri="https://example.com/jwks.json")
         provider = build_auth_provider(config)
 
-        from fastmcp.server.auth.providers.jwt import JWTVerifier
-
         assert isinstance(provider, JWTVerifier)
         assert provider.jwks_uri == "https://example.com/jwks.json"
 
     def test_jwks_uri_takes_precedence(self):
         config = AuthConfig(auth_token="my-token", jwks_uri="https://example.com/jwks.json")
         provider = build_auth_provider(config)
-
-        from fastmcp.server.auth.providers.jwt import JWTVerifier
 
         assert isinstance(provider, JWTVerifier)
 

@@ -22,6 +22,9 @@ import pytest
 from tests.common import FAILED, SUCCESS, TestCase, assert_test_case
 
 from kubeflow_mcp.core.security import (
+    _SAFE_KEYS,
+    _SENSITIVE_EXACT,
+    _SENSITIVE_SUBSTRINGS,
     is_safe_python_code,
     mask_sensitive_data,
     truncate_log_output,
@@ -437,31 +440,27 @@ def test_is_safe_python_code(test_case):
             name="masks _key suffix",
             config={"data": {"api_key": "key123"}, "key": "api_key", "expected": "***"},
         ),
-        TestCase(
-            name="masks _SENSITIVE_EXACT keys",
-            config={
-                "data": {"s3_secret_access_key": "x"},
-                "key": "s3_secret_access_key",
-                "expected": "***",
-            },
-        ),
-        TestCase(
-            name="masks _SENSITIVE_SUBSTRINGS",
-            config={
-                "data": {"my_kubeconfig_path": "x"},
-                "key": "my_kubeconfig_path",
-                "expected": "***",
-            },
-        ),
-        TestCase(
-            name="preserves _SAFE_KEYS",
-            config={"data": {"key_name": "my-key"}, "key": "key_name", "expected": "my-key"},
-        ),
     ],
 )
 def test_mask_sensitive_data(test_case):
     result = mask_sensitive_data(test_case.config["data"])
     assert result[test_case.config["key"]] == test_case.config["expected"]
+
+
+@pytest.mark.parametrize("key", sorted(_SENSITIVE_EXACT))
+def test_mask_all_sensitive_exact_keys(key):
+    assert mask_sensitive_data({key: "x"})[key] == "***"
+
+
+@pytest.mark.parametrize("substring", sorted(_SENSITIVE_SUBSTRINGS))
+def test_mask_all_sensitive_substrings(substring):
+    key = f"my_{substring}_field"
+    assert mask_sensitive_data({key: "x"})[key] == "***"
+
+
+@pytest.mark.parametrize("key", sorted(_SAFE_KEYS))
+def test_preserve_all_safe_keys(key):
+    assert mask_sensitive_data({key: "x"})[key] == "x"
 
 
 def test_mask_sensitive_data_recurses_into_nested_dicts():
