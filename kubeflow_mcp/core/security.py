@@ -239,7 +239,8 @@ def is_safe_python_code(code: str) -> tuple[bool, str]:
 
     **Flagged patterns** (via AST, not substring matching):
 
-    - Calls: ``eval``, ``exec``, ``compile``, ``__import__``, ``getattr``, ``setattr``, ``delattr``
+    - Calls: ``eval``, ``exec``, ``compile``, ``__import__``; ``getattr``/``setattr``/``delattr``
+      only when the attribute name is a literal dangerous dunder (e.g. ``"__globals__"``)
     - Module calls: ``os.system``, ``os.popen``, ``subprocess.*``, ``shutil.rmtree``
     - Imports: ``ctypes``, ``socket``
     - Dunder access: ``__builtins__``, ``__subclasses__``, ``__globals__``, ``__code__``
