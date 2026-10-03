@@ -366,9 +366,15 @@ def test_validate_training_bounds(test_case):
             expected_output="__subclasses__",
         ),
         TestCase(
-            name="getattr bypass is caught",
+            name="__builtins__ name access is caught",
             expected_status=FAILED,
             config={"code": "getattr(__builtins__, 'ev' + 'al')('1+1')"},
+            expected_output="__builtins__",
+        ),
+        TestCase(
+            name="known limitation: getattr with a computed dunder name is not caught",
+            expected_status=SUCCESS,
+            config={"code": "getattr(().__class__.__base__, '__subcl' + 'asses__')()"},
         ),
     ],
 )
