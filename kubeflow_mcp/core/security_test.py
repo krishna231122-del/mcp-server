@@ -241,12 +241,22 @@ def test_validate_resource_limits(test_case):
             config={"batch_size": 1024},
         ),
         TestCase(
-            name="lora_rank boundary",
+            name="lora_rank lower boundary",
+            expected_status=SUCCESS,
+            config={"lora_rank": 1},
+        ),
+        TestCase(
+            name="lora_rank upper boundary",
             expected_status=SUCCESS,
             config={"lora_rank": 256},
         ),
         TestCase(
-            name="num_nodes boundary",
+            name="num_nodes lower boundary",
+            expected_status=SUCCESS,
+            config={"num_nodes": 1},
+        ),
+        TestCase(
+            name="num_nodes upper boundary",
             expected_status=SUCCESS,
             config={"num_nodes": 100},
         ),
