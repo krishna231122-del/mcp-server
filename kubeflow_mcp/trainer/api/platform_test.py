@@ -137,6 +137,22 @@ def test_runtime_tools_reject_invalid_names_before_api_call(bad_name, mock_k8s_a
     assert not api.create_cluster_custom_object.called
 
 
+@pytest.mark.parametrize("bad_namespace", ["my namespace", "INVALID_NS", "namespace/name"])
+def test_inspect_controller_rejects_invalid_namespace_before_api_call(bad_namespace, monkeypatch):
+    core_api_requested = False
+
+    def fail_if_core_api_requested():
+        nonlocal core_api_requested
+        core_api_requested = True
+        raise AssertionError("Kubernetes API must not be initialized for invalid namespace")
+
+    monkeypatch.setattr(mcp_utils, "get_core_v1_api", fail_if_core_api_requested)
+    result = inspect_controller(namespace=bad_namespace)
+
+    verify_tool_error(result, error_code=VALIDATION_ERROR)
+    assert not core_api_requested
+
+
 @pytest.mark.parametrize(
     "good_name",
     ["torchtune-llama3.2-1b", "torchtune-qwen2.5-1.5b", "torch-distributed", "r1"],
@@ -340,6 +356,48 @@ def test_inspect_controller_finds_pod_despite_forbidden_namespace(
     data = verify_tool_success(result)
     assert data["pod"] == "trainer-controller-manager-0"
     assert data["namespace"] == "kubeflow-system"
+
+
+def _controller_pod(namespace: str) -> MagicMock:
+    pod = MagicMock()
+    pod.metadata.name = "trainer-controller-manager-0"
+    pod.metadata.namespace = namespace
+    pod.status.phase = "Running"
+    return pod
+
+
+def test_inspect_controller_rejects_namespace_outside_policy(mock_k8s_apis, tmp_policy_file):
+    tmp_policy_file({"policy": {"namespaces": ["team-a"]}})
+
+    result = inspect_controller(namespace="team-b")
+
+    verify_tool_error(result, error_code=PERMISSION_DENIED)
+    assert not mock_k8s_apis["core_v1"].list_namespaced_pod.called
+
+
+def test_inspect_controller_allows_namespace_in_policy(mock_k8s_apis, tmp_policy_file):
+    tmp_policy_file({"policy": {"namespaces": ["kubeflow-system"]}})
+    core = mock_k8s_apis["core_v1"]
+    core.list_namespaced_pod.return_value = MagicMock(items=[_controller_pod("kubeflow-system")])
+    core.read_namespaced_pod_log.return_value = "controller started"
+
+    result = inspect_controller(namespace="kubeflow-system")
+
+    assert verify_tool_success(result)["namespace"] == "kubeflow-system"
+
+
+def test_inspect_controller_auto_discovery_is_exempt_from_policy(
+    mock_k8s_apis, scan_default_namespaces, tmp_policy_file
+):
+    """Omitting namespace targets the admin-configured controller namespace, not the caller's."""
+    tmp_policy_file({"policy": {"namespaces": ["team-a"]}})
+    core = mock_k8s_apis["core_v1"]
+    core.list_namespaced_pod.return_value = MagicMock(items=[_controller_pod("kubeflow")])
+    core.read_namespaced_pod_log.return_value = "controller started"
+
+    result = inspect_controller()
+
+    assert verify_tool_success(result)["namespace"] == "kubeflow"
 
 
 # Remaining TODOs are outside this PR's runtime CRUD slice.

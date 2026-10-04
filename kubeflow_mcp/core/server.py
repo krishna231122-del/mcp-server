@@ -47,7 +47,7 @@ from kubeflow_mcp.core.health import (
 )
 from kubeflow_mcp.core.http_edge import register_probe_routes
 from kubeflow_mcp.core.logging import with_correlation_id
-from kubeflow_mcp.core.middleware import get_mcp_request_id, get_mcp_session_id, get_user_id
+from kubeflow_mcp.core.middleware import get_mcp_request_id, get_user_id
 from kubeflow_mcp.core.policy import (
     apply_policy_filters,
     get_allowed_tools,
@@ -106,20 +106,42 @@ def _is_blocked(result: dict[str, Any]) -> bool:
     return any(scope.get("compatible") is False or scope.get("blockers") for scope in scopes)
 
 
+_LEGACY_PREVIEW_TOOLS = frozenset({"create_runtime", "patch_runtime", "delete_runtime"})
+
+
+def _is_preview(result: dict[str, Any], tool_name: str) -> bool:
+    """Report whether a response is a confirm-gate preview rather than an executed action.
+
+    ``PreviewResponse`` sets ``status="preview"``. The trainer runtime tools still
+    use the legacy ``data.action="preview"`` shape (see docs/CONVENTIONS.md), so
+    that shape only counts for those tools. Any other tool is free to return an
+    ``action`` field of its own without losing its hint.
+    """
+    if result.get("status") == "preview":
+        return True
+    if tool_name not in _LEGACY_PREVIEW_TOOLS:
+        return False
+    data = result.get("data")
+    return isinstance(data, dict) and data.get("action") == "preview"
+
+
 def _inject_meta(result: Any, tool_name: str) -> Any:
     """Inject _meta (phase + next hint) into successful tool responses.
 
     Provides workflow guidance for clients that don't consume server
     instructions or MCP resources (e.g. Ollama, custom agents). The ``next``
     hint is withheld when the response reports blockers, so the guidance cannot
-    tell the agent to advance past an environment that is not ready.
+    tell the agent to advance past an environment that is not ready. It is also
+    withheld for confirm-gate previews: the hints describe the step after the
+    action ran, and a preview has not run anything yet.
     """
     if not isinstance(result, dict):
         return result
     if "error" in result or "error_code" in result:
         return result
     phase = TOOL_TO_PHASE.get(tool_name)
-    hint = None if _is_blocked(result) else TOOL_NEXT_HINTS.get(tool_name)
+    withheld = _is_blocked(result) or _is_preview(result, tool_name)
+    hint = None if withheld else TOOL_NEXT_HINTS.get(tool_name)
     if phase or hint:
         meta: dict[str, str] = {}
         if phase:
@@ -154,10 +176,7 @@ def _audit_wrap(tool_func):
             if _MCP_PROTOCOL_VERSION:
                 span.set_attribute("mcp.protocol.version", _MCP_PROTOCOL_VERSION)
 
-            # MCP session/request context (populated via AuditIdentityMiddleware ContextVars)
-            session_id = get_mcp_session_id()
-            if session_id:
-                span.set_attribute("mcp.session.id", session_id)
+            # MCP request context (populated via AuditIdentityMiddleware ContextVars)
             request_id = get_mcp_request_id()
             if request_id:
                 span.set_attribute("mcp.request.id", request_id)
@@ -502,14 +521,18 @@ def create_server(  # noqa: C901
             description = all_descriptions.get(tool_name)
             audited = _audit_wrap(tool_func)
 
-            if annotations and description:
-                mcp.tool(description=description, annotations=annotations)(audited)
-            elif description:
-                mcp.tool(description=description)(audited)
-            elif annotations:
-                mcp.tool(annotations=annotations)(audited)
-            else:
-                mcp.tool()(audited)
+            tool_kwargs: dict[str, Any] = {}
+            if description:
+                tool_kwargs["description"] = description
+            if annotations:
+                # MCP SDK v2's ToolAnnotations drops unknown fields, so tags go through
+                # FastMCP's own ``tags`` and reach clients as ``_meta.fastmcp.tags``.
+                annotations = dict(annotations)
+                tags = annotations.pop("tags", None)
+                tool_kwargs["annotations"] = annotations
+                if tags:
+                    tool_kwargs["tags"] = set(tags)
+            mcp.tool(**tool_kwargs)(audited)
             registered += 1
             logger.debug(f"Registered tool: {tool_name}")
 

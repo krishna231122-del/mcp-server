@@ -19,6 +19,8 @@ import time
 import uuid
 from typing import Any
 
+from kubeflow.trainer.constants import constants as trainer_constants
+
 from kubeflow_mcp.common.constants import ErrorCode
 from kubeflow_mcp.common.types import ToolError, ToolResponse, exception_details, is_k8s_not_found
 from kubeflow_mcp.common.utils import (
@@ -28,7 +30,11 @@ from kubeflow_mcp.common.utils import (
     get_trainer_client_for_namespace,
     get_trainer_effective_namespace,
 )
-from kubeflow_mcp.core.security import check_namespace_allowed, validate_k8s_name
+from kubeflow_mcp.core.security import (
+    check_namespace_allowed,
+    validate_k8s_name,
+    validate_runtime_name,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -39,6 +45,16 @@ _PACKAGES_POLL_INTERVAL = 3
 _JOB_STATUS_FILTER_ALIASES: dict[str, str] = {
     "Succeeded": "Complete",
 }
+# The statuses the Trainer SDK reports, taken from its constants so the list cannot
+# go stale. There is no "Suspended": a suspended job reports "Created".
+_VALID_JOB_STATUSES = frozenset(
+    {
+        trainer_constants.TRAINJOB_CREATED,
+        trainer_constants.TRAINJOB_RUNNING,
+        trainer_constants.TRAINJOB_COMPLETE,
+        trainer_constants.TRAINJOB_FAILED,
+    }
+)
 
 
 def _trainjob_runtime_to_mcp(runtime: object | None) -> dict[str, str] | None:
@@ -65,7 +81,8 @@ def list_training_jobs(
     Args:
         runtime: Filter by ClusterTrainingRuntime name (e.g., ``torch-tune``).
         status: Filter by TrainJob status: ``Created``, ``Running``, ``Complete``,
-            ``Failed``, ``Suspended``. ``Succeeded`` is accepted as an alias for ``Complete``.
+            ``Failed``. ``Succeeded`` is accepted as an alias for ``Complete``.
+            Suspended jobs report ``Created``.
         namespace: K8s namespace. Uses default from kubeconfig when omitted.
         limit: Maximum jobs to return. Defaults to 50.
 
@@ -74,15 +91,30 @@ def list_training_jobs(
 
         - ``jobs`` (list): List of jobs with ``name``, ``status``, ``runtime``
         - ``total`` (int): Total matching jobs
+        - ``returned`` (int): Number of jobs included in the response
+        - ``has_more`` (bool): Whether matching jobs were omitted by ``limit``
 
     Example:
         >>> list_training_jobs(status="Running")
         {"data": {"jobs": [{"name": "fine-tune-abc", "status": "Running"}], "total": 1}}
     """
     if runtime:
-        runtime_err = validate_k8s_name(runtime, "runtime")
+        runtime_err = validate_runtime_name(runtime, "runtime")
         if runtime_err is not None:
             return runtime_err.model_dump()
+
+    normalized_status = None
+    if status is not None:
+        normalized_status = _JOB_STATUS_FILTER_ALIASES.get(status, status)
+        if normalized_status not in _VALID_JOB_STATUSES:
+            return ToolError(
+                error=f"Unsupported status '{status}'",
+                error_code=ErrorCode.VALIDATION_ERROR,
+                details={
+                    "supported_statuses": sorted(_VALID_JOB_STATUSES),
+                    "aliases": dict(_JOB_STATUS_FILTER_ALIASES),
+                },
+            ).model_dump()
 
     ns_err = check_namespace_allowed(namespace)
     if ns_err is not None:
@@ -112,11 +144,18 @@ def list_training_jobs(
             }
             job_list.append(job_data)
 
-        if status:
-            want = _JOB_STATUS_FILTER_ALIASES.get(status, status)
-            job_list = [j for j in job_list if j.get("status") == want]
+        if normalized_status is not None:
+            job_list = [j for j in job_list if j.get("status") == normalized_status]
 
-        return ToolResponse(data={"jobs": job_list[:limit], "total": len(job_list)}).model_dump()
+        truncated_jobs = job_list[:limit]
+        return ToolResponse(
+            data={
+                "jobs": truncated_jobs,
+                "total": len(job_list),
+                "returned": len(truncated_jobs),
+                "has_more": len(job_list) > limit,
+            }
+        ).model_dump()
 
     except Exception as e:
         return ToolError(
@@ -450,7 +489,7 @@ def get_runtime(name: str, include_packages: bool = False) -> dict[str, Any]:
     Raises:
         ToolError: If runtime not found (``RESOURCE_NOT_FOUND``).
     """
-    name_err = validate_k8s_name(name)
+    name_err = validate_runtime_name(name)
     if name_err is not None:
         return name_err.model_dump()
 

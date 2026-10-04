@@ -48,6 +48,39 @@ class TestJobStatusFilterAliases:
         assert _JOB_STATUS_FILTER_ALIASES["Succeeded"] == "Complete"
 
 
+@pytest.mark.parametrize("status", ["", "INVALID_STATUS", "completed", "Suspended"])
+def test_list_training_jobs_rejects_invalid_status_before_sdk_call(status):
+    with patch(
+        "kubeflow_mcp.trainer.api.discovery.get_trainer_client_for_namespace"
+    ) as mock_client:
+        result = list_training_jobs(status=status)
+
+    verify_tool_error(result, error_code=ErrorCode.VALIDATION_ERROR)
+    mock_client.assert_not_called()
+
+
+def test_list_training_jobs_invalid_status_lists_supported_values():
+    result = list_training_jobs(status="INVALID_STATUS")
+
+    error = verify_tool_error(result, error_code=ErrorCode.VALIDATION_ERROR)
+    assert error["details"] == {
+        "supported_statuses": ["Complete", "Created", "Failed", "Running"],
+        "aliases": {"Succeeded": "Complete"},
+    }
+
+
+@pytest.mark.parametrize("status", ["Created", "Running", "Complete", "Failed", "Succeeded"])
+def test_list_training_jobs_accepts_supported_statuses(status):
+    with (
+        patch("kubeflow_mcp.trainer.api.discovery.check_namespace_allowed", return_value=None),
+        patch("kubeflow_mcp.trainer.api.discovery.get_trainer_client_for_namespace") as mock_client,
+    ):
+        mock_client.return_value.list_jobs.return_value = []
+        result = list_training_jobs(status=status)
+
+    verify_tool_success(result)
+
+
 class TestTrainjobRuntimeToMcp:
     def test_none_returns_none(self):
         assert _trainjob_runtime_to_mcp(None) is None
@@ -104,6 +137,29 @@ def test_rejects_invalid_resource_name_before_calling_sdk(tool, kwargs, client_p
     assert result["success"] is False
     assert result["error_code"] == ErrorCode.VALIDATION_ERROR
     mock_client.assert_not_called()
+
+
+@pytest.mark.parametrize(
+    ("tool", "kwargs", "client_path"),
+    [
+        (
+            get_runtime,
+            {"name": "torchtune-llama3.2-1b"},
+            "kubeflow_mcp.trainer.api.discovery.get_trainer_client",
+        ),
+        (
+            list_training_jobs,
+            {"runtime": "torchtune-qwen2.5-1.5b"},
+            "kubeflow_mcp.trainer.api.discovery.get_trainer_client_for_namespace",
+        ),
+    ],
+)
+def test_accepts_dotted_runtime_names(tool, kwargs, client_path):
+    with patch(client_path) as mock_client:
+        result = tool(**kwargs)
+
+    assert result.get("error_code") != ErrorCode.VALIDATION_ERROR
+    mock_client.assert_called_once()
 
 
 class TestGetRuntime:
@@ -338,6 +394,8 @@ def test_list_training_jobs_returns_all_when_no_filters():
         result = list_training_jobs()
     assert result["success"] is True
     assert result["data"]["total"] == 2
+    assert result["data"]["returned"] == 2
+    assert result["data"]["has_more"] is False
 
 
 def test_list_training_jobs_filters_by_status():
@@ -374,7 +432,31 @@ def test_list_training_jobs_empty_list_on_fresh_cluster():
         return_value=client,
     ):
         result = list_training_jobs()
-    assert result["data"] == {"jobs": [], "total": 0}
+    assert result["data"] == {
+        "jobs": [],
+        "total": 0,
+        "returned": 0,
+        "has_more": False,
+    }
+
+
+def test_list_training_jobs_reports_truncation_metadata():
+    client = MagicMock()
+    client.list_jobs.return_value = [
+        _fake_job("job-a"),
+        _fake_job("job-b"),
+        _fake_job("job-c"),
+    ]
+    with patch(
+        "kubeflow_mcp.trainer.api.discovery.get_trainer_client_for_namespace",
+        return_value=client,
+    ):
+        result = list_training_jobs(limit=2)
+
+    assert result["data"]["total"] == 3
+    assert result["data"]["returned"] == 2
+    assert result["data"]["has_more"] is True
+    assert [job["name"] for job in result["data"]["jobs"]] == ["job-a", "job-b"]
 
 
 def test_list_training_jobs_sdk_error_wrapped_as_tool_error():

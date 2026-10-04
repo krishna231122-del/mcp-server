@@ -19,7 +19,8 @@ from unittest.mock import patch
 
 import httpx
 import pytest
-from huggingface_hub.errors import RepositoryNotFoundError
+from huggingface_hub.errors import GatedRepoError, RepositoryNotFoundError
+from huggingface_hub.utils import hf_raise_for_status
 from packaging.version import Version
 from tests.common import TestCase
 
@@ -269,3 +270,87 @@ def test_estimate_from_params_small_model():
     assert result["params_billions"] == 7.0
     assert result["quantization"] == "bf16"
     assert "weights_gb" in result["breakdown"]
+
+
+# ─── Error code classification ──────────────────────────────────────────────
+
+
+def test_estimate_resources_returns_validation_error_for_invalid_format():
+    """Invalid model ID format (not org/name) must return VALIDATION_ERROR, not SDK_ERROR."""
+    with patch("huggingface_hub.list_models") as mock_list:
+        mock_list.return_value = _fake_models()
+        result = estimate_resources("random gibberish")
+
+    assert result["success"] is False
+    assert result["error_code"] == "VALIDATION_ERROR"
+    assert "Invalid HuggingFace model ID format" in result["error"]
+
+
+def test_estimate_resources_returns_validation_error_for_confirmed_404():
+    """A model ID the Hub confirms missing with a 404 is a user typo, so VALIDATION_ERROR."""
+    with (
+        patch("huggingface_hub.model_info", side_effect=_repo_not_found()),
+        patch("huggingface_hub.list_models") as mock_list,
+    ):
+        mock_list.return_value = _fake_models("meta-llama/Llama-3.2-1B")
+        result = estimate_resources("meta-lama/Llama-3")
+
+    assert result["success"] is False
+    assert result["error_code"] == "VALIDATION_ERROR"
+    assert result["details"]["suggestions"] == ["meta-llama/Llama-3.2-1B"]
+
+
+def _hub_error(error_cls: type[RepositoryNotFoundError], status_code: int):
+    request = httpx.Request("GET", "https://huggingface.co/api/models/x")
+    return error_cls("Hub error", response=httpx.Response(status_code, request=request))
+
+
+@pytest.mark.parametrize(
+    "hub_error",
+    [
+        _hub_error(RepositoryNotFoundError, 401),  # private repo or missing auth
+        _hub_error(GatedRepoError, 403),  # gated repo
+    ],
+)
+def test_estimate_resources_keeps_sdk_error_for_access_failures(hub_error):
+    """An inaccessible repo is not a typo, so it must not become VALIDATION_ERROR."""
+    with (
+        patch("huggingface_hub.model_info", side_effect=hub_error),
+        patch("huggingface_hub.list_models", return_value=[]),
+    ):
+        result = estimate_resources("meta-llama/Llama-3.2-1B")
+
+    assert result["success"] is False
+    assert result["error_code"] == "SDK_ERROR"
+
+
+def test_estimate_resources_keeps_sdk_error_for_anonymous_401():
+    """The Hub answers an anonymous request for a missing model with 401, the same
+    as for a private repo, so it cannot be classified as bad input."""
+    request = httpx.Request("GET", "https://huggingface.co/api/models/meta-lama/Llama-3")
+    response = httpx.Response(
+        401, headers={"X-Error-Message": "Invalid username or password."}, request=request
+    )
+    with pytest.raises(RepositoryNotFoundError) as hub_error:
+        hf_raise_for_status(response)
+
+    with (
+        patch("huggingface_hub.model_info", side_effect=hub_error.value),
+        patch("huggingface_hub.list_models", return_value=[]),
+    ):
+        result = estimate_resources("meta-lama/Llama-3")
+
+    assert result["success"] is False
+    assert result["error_code"] == "SDK_ERROR"
+
+
+def test_estimate_resources_returns_sdk_error_for_api_failure():
+    """Actual API/network failures must still return SDK_ERROR."""
+    with patch(
+        "kubeflow_mcp.trainer.api.planning._get_model_info_from_hf",
+        return_value={"error": "Connection timed out"},
+    ):
+        result = estimate_resources("meta-llama/Llama-3.2-1B")
+
+    assert result["success"] is False
+    assert result["error_code"] == "SDK_ERROR"

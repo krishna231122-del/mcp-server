@@ -40,6 +40,43 @@ cd mcp-server
 make install-dev
 ```
 
+### Prerequisites
+
+Before starting the Kubeflow MCP Server, make sure the following requirements
+are available:
+
+- Python 3.10, 3.11, or 3.12
+- A running Kubernetes cluster
+- `kubectl` installed and available in `PATH`
+- A kubeconfig configured for the target cluster
+- Kubeflow Trainer installed in the cluster
+- Kubeflow Trainer CRDs and at least one `ClusterTrainingRuntime`
+- Kubernetes permissions for the namespace you train in, plus cluster-scoped
+  read access for planning and runtime discovery (see
+  [RBAC Configuration](ARCHITECTURE.md#rbac-configuration))
+
+Verify the connection and your permissions in the target namespace. Each
+`can-i` command should print `yes`:
+
+```bash
+kubectl config current-context
+kubectl auth can-i create trainjobs.trainer.kubeflow.org -n <namespace>
+kubectl auth can-i list pods -n <namespace>
+kubectl auth can-i get pods --subresource=log -n <namespace>
+```
+
+The checks below need cluster-scoped read access, so they can return
+`Forbidden` for a namespace-scoped user even when Kubeflow Trainer is installed
+correctly. Without that access, the tools that read these resources
+(`get_cluster_resources`, `check_compatibility`, `list_runtimes`) fail; tools
+that work on jobs in your namespace are unaffected.
+
+```bash
+kubectl get nodes
+kubectl get crd trainjobs.trainer.kubeflow.org
+kubectl get clustertrainingruntimes
+```
+
 ### Run the server
 
 ```bash
@@ -75,7 +112,7 @@ dependencies.
 
 | Variable | Default | Description |
 |---|---|---|
-| `MCP_TRANSPORT` | `stdio` | Transport protocol (`http`, `sse`, `stdio`) |
+| `MCP_TRANSPORT` | `stdio` | Transport protocol (`http`, `stdio`; `sse` is deprecated) |
 | `KUBEFLOW_MCP_AUTH_TOKEN` | _(none)_ | Bearer token for HTTP auth |
 | `KUBEFLOW_MCP_JWKS_URI` | _(none)_ | JWKS endpoint for JWT verification (production) |
 | `KUBEFLOW_MCP_JWT_ISSUER` | _(none)_ | Expected JWT issuer |
@@ -189,7 +226,7 @@ claude mcp add kubeflow -- kubeflow-mcp serve
 # Persona: readonly | data-scientist | ml-engineer | platform-admin
 # Mode: full | progressive | semantic
 # Instruction tier: full | compact | minimal
-# Transport: stdio | http | sse
+# Transport: stdio | http | sse (deprecated)
 # Auth token: bearer token for HTTP auth (dev/staging)
 # OTel endpoint: optional OTLP HTTP endpoint for tracing
 # Log level: DEBUG | INFO | WARNING | ERROR
@@ -209,6 +246,15 @@ kubeflow-mcp serve \
 ```
 
 `--mode progressive` exposes 3 meta-tools (~85 tokens) for hierarchical discovery. `--mode semantic` exposes 2 meta-tools (~69 tokens) using embedding search. Both reduce token consumption significantly for agent workflows.
+
+`--persona` controls which tools are exposed. Each persona includes the tools of the one above it:
+
+| Persona | Use it for |
+|---|---|
+| `readonly` (default) | Planning, browsing jobs and runtimes, reading logs and events |
+| `data-scientist` | Submitting fine-tuning and custom training, waiting for jobs, deleting MCP-created jobs |
+| `ml-engineer` | Container training, suspending/resuming jobs, inspecting CRDs and the controller |
+| `platform-admin` | All tools, including creating, patching and deleting runtimes |
 
 <details>
 <summary> HTTP Authentication</summary>
@@ -259,7 +305,7 @@ make verify                       # lint + format check
 make test-python                  # run tests
 make inspector                    # launch MCP Inspector (stdio)
 make inspector TRANSPORT=http     # Inspector + Streamable HTTP (start server separately)
-make inspector TRANSPORT=sse      # Inspector + SSE (start server separately)
+make inspector TRANSPORT=sse      # Inspector + SSE (deprecated; start server separately)
 ```
 
 ## Community
