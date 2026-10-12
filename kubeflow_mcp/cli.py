@@ -52,7 +52,8 @@ def cli() -> None:
     "-t",
     default=None,
     type=click.Choice(["stdio", "http", "sse"]),
-    help="MCP transport protocol. Falls back to MCP_TRANSPORT env var, config file, then 'stdio'.",
+    help="MCP transport protocol ('sse' is deprecated, use 'http'). "
+    "Falls back to MCP_TRANSPORT env var, config file, then 'stdio'.",
 )
 @click.option(
     "--log-level",
@@ -194,7 +195,9 @@ def serve(
                 "KUBEFLOW_MCP_DNS_REBINDING_PROTECTION=true to re-enable it."
             )
 
-    client_list = [c.strip() for c in clients.split(",")]
+    client_list = [c.strip() for c in clients.split(",") if c.strip()]
+    if not client_list:
+        raise click.ClickException("at least one client must be specified")
     server = create_server(
         clients=client_list,
         persona=persona,
@@ -207,6 +210,10 @@ def serve(
     if transport == "stdio":
         server.run(show_banner=show_banner)
     elif transport == "sse":
+        logger.warning(
+            "The SSE transport is deprecated and will be removed in a future release. "
+            "Use --transport http (Streamable HTTP) instead."
+        )
         server.run(transport="sse", show_banner=show_banner, middleware=http_middleware)
     else:
         server.run(

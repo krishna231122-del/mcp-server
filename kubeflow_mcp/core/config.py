@@ -139,8 +139,10 @@ class ResilienceConfig(BaseModel):
 
     rate_limit: float = Field(default=10.0, description="Requests/second refill rate")
     rate_capacity: float = Field(default=20.0, description="Max burst capacity")
-    cb_failure_threshold: int = Field(default=5, description="Failures before circuit opens")
-    cb_recovery_timeout: float = Field(default=30.0, description="Seconds before half-open retry")
+    cb_failure_threshold: int = Field(default=5, gt=0, description="Failures before circuit opens")
+    cb_recovery_timeout: float = Field(
+        default=30.0, ge=0, description="Seconds before half-open retry"
+    )
 
 
 class OptimizerConfig(BaseModel):
@@ -203,7 +205,7 @@ def _load_yaml_config(path: Path) -> dict[str, Any]:
         logger.warning("PyYAML not installed, skipping config file")
         return {}
     except Exception as e:
-        logger.warning(f"Failed to load config from {path}: {e}")
+        logger.warning("Failed to load config from %s: %s", path, e)
         return {}
 
 
@@ -237,14 +239,16 @@ def load_config(config_path: Path | None = None) -> Config:
 
     # Build server config with env overrides
     server_file = file_config.get("server", {})
+    raw_clients = os.getenv(
+        "KUBEFLOW_MCP_CLIENTS",
+        ",".join(server_file.get("clients", ["trainer"])),
+    )
+    clients = [c.strip() for c in raw_clients.split(",") if c.strip()]
+    if raw_clients.strip() and not clients:
+        raise ValueError("at least one client must be specified")
+
     server = ServerConfig(
-        clients=[
-            c.strip()
-            for c in os.getenv(
-                "KUBEFLOW_MCP_CLIENTS",
-                ",".join(server_file.get("clients", ["trainer"])),
-            ).split(",")
-        ],
+        clients=clients,
         persona=os.getenv(
             "KUBEFLOW_MCP_PERSONA",
             server_file.get("persona", "readonly"),

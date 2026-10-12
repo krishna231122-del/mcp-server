@@ -17,6 +17,8 @@
 from __future__ import annotations
 
 import time
+from collections.abc import Callable
+from unittest.mock import AsyncMock
 
 import pytest
 
@@ -29,13 +31,53 @@ from kubeflow_mcp.core.resilience import (
     get_breaker,
     reset_breakers,
     retry_with_backoff,
+    retry_with_backoff_async,
     with_circuit_breaker,
 )
+
+
+@pytest.fixture
+def clock(monkeypatch: pytest.MonkeyPatch) -> Callable[[float], None]:
+    """Hand-driven monotonic clock for the resilience module.
+
+    A real sleep is measured through time.monotonic(), whose resolution is
+    15.625 ms on Windows. That is coarser than the margins these tests allow,
+    so a sleep can read shorter than it was. Advancing a fake clock removes the
+    dependence on how finely the platform measures time.
+    """
+    now = [1000.0]
+    monkeypatch.setattr("kubeflow_mcp.core.resilience.time.monotonic", lambda: now[0])
+
+    def advance(seconds: float) -> None:
+        now[0] += seconds
+
+    return advance
+
 
 # ─── CircuitBreaker ─────────────────────────────────────────────────────────
 
 
 class TestCircuitBreaker:
+    @pytest.mark.parametrize(
+        ("kwargs", "message"),
+        [
+            ({"failure_threshold": 0}, "failure_threshold"),
+            ({"failure_threshold": -1}, "failure_threshold"),
+            ({"recovery_timeout": -0.1}, "recovery_timeout"),
+            ({"half_open_max_calls": 0}, "half_open_max_calls"),
+            ({"half_open_max_calls": -1}, "half_open_max_calls"),
+        ],
+    )
+    def test_rejects_invalid_configuration(self, kwargs, message):
+        with pytest.raises(ValueError, match=message):
+            CircuitBreaker(**kwargs)
+
+    def test_zero_recovery_timeout_is_allowed(self):
+        cb = CircuitBreaker(failure_threshold=1, recovery_timeout=0.0)
+        cb.record_failure()
+        assert cb.acquire() is not None
+        assert cb.state == CircuitState.HALF_OPEN
+
     def test_starts_closed(self):
         cb = CircuitBreaker()
         assert cb.state == CircuitState.CLOSED
@@ -91,7 +133,77 @@ class TestCircuitBreaker:
         cb.record_failure()
         assert cb.state == CircuitState.OPEN
 
-    # TODO(test): test half_open_max_calls limit
+    def test_half_open_max_calls_limit(self, clock):
+        cb = CircuitBreaker(failure_threshold=1, recovery_timeout=0.05, half_open_max_calls=2)
+        cb.record_failure()
+        clock(0.06)
+
+        assert cb.can_execute() is True
+        assert cb.can_execute() is True
+        assert cb.can_execute() is False
+        assert cb.half_open_calls == 2
+
+    @pytest.mark.slow
+    def test_full_window_is_not_replaced_while_probes_are_out(self):
+        """A slow probe keeps its window, however long it takes to report."""
+        cb = CircuitBreaker(failure_threshold=1, recovery_timeout=0.01, half_open_max_calls=1)
+        cb.record_failure()
+        time.sleep(0.02)
+
+        assert cb.can_execute() is True
+        time.sleep(0.02)
+        assert cb.can_execute() is False
+
+    def test_release_hands_back_a_half_open_slot(self):
+        """A call that says nothing about the backend frees its slot without counting."""
+        cb = CircuitBreaker(failure_threshold=1, recovery_timeout=0.0, half_open_max_calls=2)
+        cb.record_failure()
+
+        first = cb.acquire()
+        cb.acquire()
+        assert cb.acquire() is None
+
+        cb.release(first)
+        assert cb.half_open_calls == 1
+        assert cb.acquire() is not None
+        assert cb.state == CircuitState.HALF_OPEN
+
+    def test_release_does_not_reset_failure_count(self):
+        cb = CircuitBreaker(failure_threshold=3)
+        cb.record_failure()
+        cb.record_failure()
+        cb.release(cb.acquire())
+        assert cb.failure_count == 2
+
+    def test_late_report_from_previous_window_is_ignored(self):
+        cb = CircuitBreaker(failure_threshold=1, recovery_timeout=0.0, half_open_max_calls=3)
+        cb.record_failure()
+
+        slow = cb.acquire()
+        cb.record_failure(cb.acquire())  # sends that window back to OPEN
+        current = cb.acquire()  # and this opens the next one
+
+        cb.record_success(slow)
+        cb.release(slow)
+        cb.record_failure(slow)
+        assert cb.state == CircuitState.HALF_OPEN
+        assert cb.half_open_calls == 1
+
+        # Two fresh successes are one short of closing, so the late one did not count.
+        cb.record_success(current)
+        cb.record_success(current)
+        assert cb.state == CircuitState.HALF_OPEN
+
+    def test_recovery_ignores_wall_clock_jumps(self, monkeypatch):
+        """A wall-clock jump must not release the circuit before its timeout."""
+        cb = CircuitBreaker(failure_threshold=1, recovery_timeout=60.0)
+        cb.record_failure()
+
+        jumped = time.time() + 3600
+        monkeypatch.setattr("time.time", lambda: jumped)
+        assert cb.can_execute() is False
+        assert cb.state == CircuitState.OPEN
+
     # TODO(test): test thread safety with concurrent record_failure/record_success
 
 
@@ -99,6 +211,21 @@ class TestCircuitBreaker:
 
 
 class TestGetBreaker:
+    @pytest.mark.parametrize(
+        ("failure_threshold", "recovery_timeout", "message"),
+        [
+            (0, 30.0, "failure_threshold"),
+            (-1, 30.0, "failure_threshold"),
+            (5, -0.1, "recovery_timeout"),
+        ],
+    )
+    def test_configure_rejects_invalid_values(self, failure_threshold, recovery_timeout, message):
+        with pytest.raises(ValueError, match=message):
+            configure_circuit_breaker(
+                failure_threshold=failure_threshold,
+                recovery_timeout=recovery_timeout,
+            )
+
     def test_returns_same_instance(self):
         a = get_breaker("tool_a")
         b = get_breaker("tool_a")
@@ -178,12 +305,23 @@ class TestRateLimiter:
         rl.acquire()
         assert rl.acquire() is False
 
-    @pytest.mark.slow
-    def test_tokens_refill_over_time(self):
+    def test_tokens_refill_over_time(self, clock):
         rl = RateLimiter(rate=1000.0, capacity=5.0)
         for _ in range(5):
             rl.acquire()
-        time.sleep(0.01)
+        assert rl.acquire() is False
+        clock(0.01)
+        assert rl.acquire() is True
+
+    def test_acquire_ignores_wall_clock_jumps(self, monkeypatch):
+        """A backward wall-clock step must not drain the bucket.
+
+        time.time is patched because that is the clock the limiter used to read.
+        Patching monotonic would assert a step it cannot make.
+        """
+        rl = RateLimiter(rate=10.0, capacity=5.0)
+
+        monkeypatch.setattr("time.time", lambda: 0.0)
         assert rl.acquire() is True
 
     # TODO(test): test thread safety with concurrent acquire
@@ -223,7 +361,132 @@ class TestRetryWithBackoff:
             always_fail()
 
     # TODO(test): test retryable_exceptions filtering
-    # TODO(test): test retry_with_backoff_async
+
+
+# ─── retry_with_backoff_async ─────────────────────────────────────────────
+
+
+class TestRetryWithBackoffAsync:
+    """Tests for retry_with_backoff_async — cap, jitter, and retry logic."""
+
+    async def test_succeeds_on_first_try(self):
+        async def ok():
+            return "done"
+
+        result = await retry_with_backoff_async(ok)
+        assert result == "done"
+
+    async def test_retries_then_succeeds(self, monkeypatch):
+        monkeypatch.setattr("asyncio.sleep", AsyncMock())
+        call_count = 0
+
+        async def flaky():
+            nonlocal call_count
+            call_count += 1
+            if call_count < 3:
+                raise ValueError("transient")
+            return "ok"
+
+        result = await retry_with_backoff_async(flaky, max_retries=3, base_delay=1.0)
+        assert result == "ok"
+        assert call_count == 3
+
+    async def test_raises_after_all_retries_exhausted(self, monkeypatch):
+        monkeypatch.setattr("asyncio.sleep", AsyncMock())
+
+        async def always_fail():
+            raise ValueError("permanent")
+
+        with pytest.raises(ValueError, match="permanent"):
+            await retry_with_backoff_async(always_fail, max_retries=2, base_delay=1.0)
+
+    async def test_delay_is_capped_at_max_delay(self, monkeypatch):
+        """asyncio.sleep must never receive a value exceeding max_delay (jitter=0)."""
+        sleep_calls: list[float] = []
+
+        async def fake_sleep(secs: float) -> None:
+            sleep_calls.append(secs)
+
+        monkeypatch.setattr("asyncio.sleep", fake_sleep)
+        monkeypatch.setattr("random.uniform", lambda a, b: 0.0)
+
+        async def always_fail():
+            raise ValueError("x")
+
+        with pytest.raises(ValueError):
+            await retry_with_backoff_async(
+                always_fail,
+                max_retries=10,
+                base_delay=1.0,
+                max_delay=30.0,
+                jitter=0.0,
+            )
+
+        assert sleep_calls, "expected at least one sleep call"
+        assert max(sleep_calls) <= 30.0, (
+            f"delay exceeded max_delay=30.0; got max={max(sleep_calls)}"
+        )
+
+    async def test_jitter_is_applied(self, monkeypatch):
+        """random.uniform must be called with bounds derived from the capped delay."""
+        sleep_calls: list[float] = []
+        uniform_calls: list[tuple[float, float]] = []
+
+        async def fake_sleep(secs: float) -> None:
+            sleep_calls.append(secs)
+
+        def fake_uniform(a: float, b: float) -> float:
+            uniform_calls.append((a, b))
+            return b
+
+        monkeypatch.setattr("asyncio.sleep", fake_sleep)
+        monkeypatch.setattr("random.uniform", fake_uniform)
+
+        async def always_fail():
+            raise ValueError("x")
+
+        with pytest.raises(ValueError):
+            await retry_with_backoff_async(
+                always_fail,
+                max_retries=2,
+                base_delay=1.0,
+                max_delay=30.0,
+                jitter=0.1,
+            )
+
+        assert uniform_calls, "expected random.uniform to be called"
+        # For attempt 0: capped delay = min(1.0 * 2^0, 30) = 1.0; jitter bounds = (-0.1, 0.1)
+        lo, hi = uniform_calls[0]
+        assert lo < 0 and hi > 0, "jitter bounds should straddle zero"
+        assert abs(lo) == pytest.approx(abs(hi)), "jitter bounds should be symmetric"
+        assert sleep_calls == [1.1, 2.2]
+
+    async def test_no_sleep_after_last_attempt(self, monkeypatch):
+        """Sleep must not be called after the final failed attempt."""
+        sleep_calls: list[float] = []
+
+        async def fake_sleep(secs: float) -> None:
+            sleep_calls.append(secs)
+
+        monkeypatch.setattr("asyncio.sleep", fake_sleep)
+
+        async def always_fail():
+            raise ValueError("x")
+
+        with pytest.raises(ValueError):
+            await retry_with_backoff_async(always_fail, max_retries=2, base_delay=0.001)
+
+        # max_retries=2 → 3 total attempts → sleep called exactly 2 times (not after the last).
+        assert len(sleep_calls) == 2
+
+    async def test_passes_args_and_kwargs(self):
+        """Positional and keyword arguments must be forwarded to the wrapped function."""
+
+        async def add(a: int, b: int = 0) -> int:
+            return a + b
+
+        result = await retry_with_backoff_async(add, 3, b=4)
+        assert result == 7
 
 
 # ─── SessionManager ─────────────────────────────────────────────────────────

@@ -23,6 +23,10 @@ from kubeflow_mcp.common.types import ToolError
 
 K8S_NAME_PATTERN = re.compile(r"^[a-z0-9]([-a-z0-9]*[a-z0-9])?$")
 MAX_NAME_LENGTH = 63
+K8S_SUBDOMAIN_PATTERN = re.compile(
+    r"^[a-z0-9]([-a-z0-9]*[a-z0-9])?(\.[a-z0-9]([-a-z0-9]*[a-z0-9])?)*$"
+)
+MAX_SUBDOMAIN_LENGTH = 253
 
 
 def validate_k8s_name(name: str, field: str = "name") -> ToolError | None:
@@ -42,11 +46,51 @@ def validate_k8s_name(name: str, field: str = "name") -> ToolError | None:
             error_code=ErrorCode.VALIDATION_ERROR,
         )
 
-    if not K8S_NAME_PATTERN.match(name):
+    if not K8S_NAME_PATTERN.fullmatch(name):
         return ToolError(
             error=f"{field} must be lowercase alphanumeric with hyphens",
             error_code=ErrorCode.VALIDATION_ERROR,
             details={"value": name, "pattern": K8S_NAME_PATTERN.pattern},
+        )
+
+    return None
+
+
+def validate_runtime_name(name: str, field: str = "name") -> ToolError | None:
+    """Validate a training runtime name.
+
+    Runtime names are Kubernetes object names, so unlike job names they may
+    contain dots, as in ``torchtune-llama3.2-1b``.
+
+    Returns ToolError if invalid, None if valid.
+    """
+    if not name:
+        return ToolError(
+            error=f"{field} cannot be empty",
+            error_code=ErrorCode.VALIDATION_ERROR,
+        )
+
+    if len(name) > MAX_SUBDOMAIN_LENGTH:
+        return ToolError(
+            error=f"{field} too long (max {MAX_SUBDOMAIN_LENGTH})",
+            error_code=ErrorCode.VALIDATION_ERROR,
+        )
+
+    if not K8S_SUBDOMAIN_PATTERN.fullmatch(name):
+        return ToolError(
+            error=f"{field} must be lowercase alphanumeric with hyphens or dots",
+            error_code=ErrorCode.VALIDATION_ERROR,
+            details={"value": name, "pattern": K8S_SUBDOMAIN_PATTERN.pattern},
+        )
+
+    # RFC 1123 caps each dot-separated label independently of the total length,
+    # so a name under 253 chars can still carry a label the API server rejects.
+    oversized = [label for label in name.split(".") if len(label) > MAX_NAME_LENGTH]
+    if oversized:
+        return ToolError(
+            error=f"{field} has a label longer than {MAX_NAME_LENGTH} characters",
+            error_code=ErrorCode.VALIDATION_ERROR,
+            details={"value": name, "labels": oversized},
         )
 
     return None
@@ -58,7 +102,11 @@ def validate_namespace(namespace: str) -> ToolError | None:
 
 
 def check_namespace_allowed(namespace: str | None) -> ToolError | None:
-    """Check if namespace is allowed by policy.
+    """Check that a namespace is well formed and allowed by policy.
+
+    A caller-supplied namespace is format-checked first. Without an allowlist
+    the policy check accepts any string, so a malformed value would otherwise
+    reach the Kubernetes API and come back as a misleading "not found".
 
     When *namespace* is ``None`` the effective default namespace from the
     TrainerClient backend is resolved and checked against the allowlist so
@@ -68,8 +116,13 @@ def check_namespace_allowed(namespace: str | None) -> ToolError | None:
         namespace: Namespace to check. ``None`` resolves to the effective default.
 
     Returns:
-        ToolError if namespace is restricted, None if allowed
+        ToolError if namespace is malformed or restricted, None if allowed
     """
+    if namespace is not None:
+        format_err = validate_namespace(namespace)
+        if format_err is not None:
+            return format_err
+
     # Import here to avoid circular import
     from kubeflow_mcp.core.policy import get_allowed_namespaces
 
@@ -138,8 +191,17 @@ class _ScriptSafetyVisitor(ast.NodeVisitor):
         self.warnings: list[str] = []
 
     def visit_Call(self, node: ast.Call) -> None:  # noqa: N802
-        if isinstance(node.func, ast.Name) and node.func.id in _DANGEROUS_CALLS:
-            self.warnings.append(f"Dangerous call: {node.func.id}() at line {node.lineno}")
+        if isinstance(node.func, ast.Name):
+            if node.func.id in _DANGEROUS_CALLS:
+                self.warnings.append(f"Dangerous call: {node.func.id}() at line {node.lineno}")
+            elif node.func.id in {"getattr", "setattr", "delattr"}:
+                if len(node.args) >= 2:
+                    attr_arg = node.args[1]
+                    if isinstance(attr_arg, ast.Constant) and isinstance(attr_arg.value, str):
+                        if attr_arg.value in _DANGEROUS_DUNDER:
+                            self.warnings.append(
+                                f"Dangerous call: {node.func.id}() at line {node.lineno}"
+                            )
         elif isinstance(node.func, ast.Attribute):
             if isinstance(node.func.value, ast.Name):
                 module = node.func.value.id
@@ -168,6 +230,11 @@ class _ScriptSafetyVisitor(ast.NodeVisitor):
             self.warnings.append(f"Dangerous attribute access: {node.attr} at line {node.lineno}")
         self.generic_visit(node)
 
+    def visit_Name(self, node: ast.Name) -> None:  # noqa: N802
+        if node.id in _DANGEROUS_DUNDER:
+            self.warnings.append(f"Dangerous name access: {node.id} at line {node.lineno}")
+        self.generic_visit(node)
+
 
 def is_safe_python_code(code: str) -> tuple[bool, str]:
     """AST-based scan for dangerous patterns in training scripts.
@@ -181,7 +248,8 @@ def is_safe_python_code(code: str) -> tuple[bool, str]:
 
     **Flagged patterns** (via AST, not substring matching):
 
-    - Calls: ``eval``, ``exec``, ``compile``, ``__import__``
+    - Calls: ``eval``, ``exec``, ``compile``, ``__import__``; ``getattr``/``setattr``/``delattr``
+      only when the attribute name is a literal dangerous dunder (e.g. ``"__globals__"``)
     - Module calls: ``os.system``, ``os.popen``, ``subprocess.*``, ``shutil.rmtree``
     - Imports: ``ctypes``, ``socket``
     - Dunder access: ``__builtins__``, ``__subclasses__``, ``__globals__``, ``__code__``
@@ -206,9 +274,17 @@ def is_safe_python_code(code: str) -> tuple[bool, str]:
 
 
 def truncate_log_output(output: str, max_length: int = 10000) -> str:
-    """Truncate log output to a safe length for MCP responses."""
+    """Truncate log output to a safe length for MCP responses.
+
+    Keeps the tail. Callers pass the most recent slice of a workload's log,
+    where a failure lands, so cutting from the front drops the part worth
+    reading.
+    """
+    # A zero limit would slice as output[-0:], which is the whole log.
+    if max_length < 1:
+        raise ValueError(f"max_length must be >= 1, got {max_length}")
     if len(output) > max_length:
-        output = output[:max_length] + f"\n... (truncated, {len(output)} total chars)"
+        output = f"... (truncated, {len(output)} total chars)\n" + output[-max_length:]
     return output
 
 
@@ -329,21 +405,30 @@ _SENSITIVE_SUBSTRINGS = {
 _SAFE_KEYS = {"public_key", "keyword", "key_format", "key_name"}
 
 
+def is_sensitive_key(key: str) -> bool:
+    """Return True when a key names a credential, e.g. ``api_key`` or ``accessToken``.
+
+    Shared with free-text log redaction so both paths agree on what is sensitive.
+    """
+    k = key.lower()
+    if k in _SAFE_KEYS:
+        return False
+    return (
+        k in _SENSITIVE_EXACT
+        or any(s in k for s in _SENSITIVE_SUBSTRINGS)
+        or k.endswith("_key")
+        or k.endswith("token")
+    )
+
+
 def mask_sensitive_data(data: dict[str, Any]) -> dict[str, Any]:
     """Mask sensitive fields in data for logging."""
     result: dict[str, Any] = {}
 
     for k, v in data.items():
-        k_lower = k.lower()
-        if k_lower in _SAFE_KEYS:
+        if k.lower() in _SAFE_KEYS:
             result[k] = v
-        elif k_lower in _SENSITIVE_EXACT:
-            result[k] = "***"
-        elif any(s in k_lower for s in _SENSITIVE_SUBSTRINGS):
-            result[k] = "***"
-        elif k_lower.endswith("_key") and k_lower not in _SAFE_KEYS:
-            result[k] = "***"
-        elif k_lower.endswith("_token"):
+        elif is_sensitive_key(k):
             result[k] = "***"
         elif isinstance(v, dict):
             result[k] = mask_sensitive_data(v)

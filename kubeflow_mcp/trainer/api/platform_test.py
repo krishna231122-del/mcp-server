@@ -16,12 +16,16 @@
 
 from __future__ import annotations
 
+from datetime import datetime, timezone
+from unittest.mock import MagicMock
+
 import pytest
 from kubeflow.trainer.constants import constants as trainer_constants
 from kubernetes.client.exceptions import ApiException
 from tests.common import (
     FAILED,
     KUBERNETES_ERROR,
+    PERMISSION_DENIED,
     RESOURCE_NOT_FOUND,
     SUCCESS,
     VALIDATION_ERROR,
@@ -32,7 +36,13 @@ from tests.common import (
 from kubeflow_mcp.common import utils as mcp_utils
 from kubeflow_mcp.conftest import create_mock_trainjob, verify_tool_error, verify_tool_success
 from kubeflow_mcp.core.policy import get_allowed_tools
-from kubeflow_mcp.trainer.api.platform import create_runtime, delete_runtime, patch_runtime
+from kubeflow_mcp.trainer.api.platform import (
+    create_runtime,
+    delete_runtime,
+    inspect_controller,
+    inspect_crd,
+    patch_runtime,
+)
 
 # ─── Validation ─────────────────────────────────────────────────────────────
 
@@ -91,6 +101,71 @@ def test_patch_runtime_validation(test_case):
 )
 def test_create_runtime_validation(test_case):
     assert_test_case(test_case, create_runtime)
+
+
+_BAD_RUNTIME_NAMES = [
+    "",
+    "   ",
+    "UPPER-Case",
+    "bad_underscore",
+    "name with space",
+    "../escape",
+    "name/slash",
+    "-leading",
+    "trailing-",
+    "a" * 300,
+]
+
+
+@pytest.mark.parametrize("bad_name", _BAD_RUNTIME_NAMES)
+def test_runtime_tools_reject_invalid_names_before_api_call(bad_name, mock_k8s_apis):
+    """Runtime CRUD must validate names like every other trainer module.
+
+    The K8s API would reject most of these too, but the tools reported success
+    and issued the call, which is inconsistent with discovery/monitoring and
+    lets an empty name reach a cluster-scoped delete.
+    """
+    api = mock_k8s_apis["custom"]
+
+    for result in (
+        delete_runtime(bad_name, confirmed=True),
+        patch_runtime(bad_name, patch={"spec": {"template": {}}}, confirmed=True),
+        create_runtime(bad_name, spec={"template": {}}, confirmed=True),
+    ):
+        verify_tool_error(result, error_code=VALIDATION_ERROR)
+
+    assert not api.delete_cluster_custom_object.called
+    assert not api.patch_cluster_custom_object.called
+    assert not api.create_cluster_custom_object.called
+
+
+@pytest.mark.parametrize("bad_namespace", ["my namespace", "INVALID_NS", "namespace/name"])
+def test_inspect_controller_rejects_invalid_namespace_before_api_call(bad_namespace, monkeypatch):
+    core_api_requested = False
+
+    def fail_if_core_api_requested():
+        nonlocal core_api_requested
+        core_api_requested = True
+        raise AssertionError("Kubernetes API must not be initialized for invalid namespace")
+
+    monkeypatch.setattr(mcp_utils, "get_core_v1_api", fail_if_core_api_requested)
+    result = inspect_controller(namespace=bad_namespace)
+
+    verify_tool_error(result, error_code=VALIDATION_ERROR)
+    assert not core_api_requested
+
+
+@pytest.mark.parametrize(
+    "good_name",
+    ["torchtune-llama3.2-1b", "torchtune-qwen2.5-1.5b", "torch-distributed", "r1"],
+)
+def test_runtime_tools_accept_dotted_runtime_names(good_name, mock_k8s_apis):
+    """Runtime names are K8s object names, so the torchtune runtimes Trainer
+    ships (which contain dots) must keep working."""
+    result = delete_runtime(good_name, confirmed=False)
+
+    data = verify_tool_success(result)
+    assert data["runtime"] == good_name
 
 
 # ─── Runtime CRUD ───────────────────────────────────────────────────────────
@@ -226,9 +301,154 @@ def test_non_admin_persona_cannot_manage_runtimes():
     assert "delete_runtime" not in allowed_tools
 
 
+# ─── inspect_crd ─────────────────────────────────────────────────────────────
+
+
+def test_inspect_crd_not_found(mock_k8s_apis):
+    api = mock_k8s_apis["apiextensions"]
+    api.read_custom_resource_definition.side_effect = ApiException(status=404, reason="Not Found")
+
+    result = inspect_crd("missing.trainer.kubeflow.org")
+
+    verify_tool_error(result, error_code=RESOURCE_NOT_FOUND)
+
+
+# ─── inspect_controller ─────────────────────────────────────────────────────
+
+
+@pytest.fixture
+def scan_default_namespaces(monkeypatch):
+    monkeypatch.setattr("kubeflow_mcp.trainer.api.platform._get_controller_namespace", lambda: None)
+
+
+@pytest.mark.parametrize(
+    ("lookup_error", "error_code"),
+    [
+        (ApiException(status=403, reason="Forbidden"), PERMISSION_DENIED),
+        (ApiException(status=500, reason="Internal Server Error"), KUBERNETES_ERROR),
+        (ConnectionError("Connection refused"), KUBERNETES_ERROR),
+    ],
+)
+def test_inspect_controller_reports_failed_lookup_instead_of_missing_pod(
+    mock_k8s_apis, scan_default_namespaces, lookup_error, error_code
+):
+    mock_k8s_apis["core_v1"].list_namespaced_pod.side_effect = lookup_error
+
+    result = inspect_controller()
+
+    error = verify_tool_error(result, error_code=error_code)
+    assert "No controller pod found" not in error["error"]
+
+
+def test_inspect_controller_missing_pod_is_still_not_found(mock_k8s_apis, scan_default_namespaces):
+    mock_k8s_apis["core_v1"].list_namespaced_pod.return_value = MagicMock(items=[])
+
+    result = inspect_controller()
+
+    verify_tool_error(result, error_code=RESOURCE_NOT_FOUND)
+
+
+def test_inspect_controller_finds_pod_despite_forbidden_namespace(
+    mock_k8s_apis, scan_default_namespaces
+):
+    core = mock_k8s_apis["core_v1"]
+    pod = MagicMock()
+    pod.metadata.name = "trainer-controller-manager-0"
+    pod.metadata.namespace = "kubeflow-system"
+    pod.status.phase = "Running"
+
+    def list_pods(namespace, **_kwargs):
+        if namespace == "kubeflow":
+            raise ApiException(status=403, reason="Forbidden")
+        return MagicMock(items=[pod])
+
+    core.list_namespaced_pod.side_effect = list_pods
+    core.read_namespaced_pod_log.return_value = "controller started"
+
+    result = inspect_controller()
+
+    data = verify_tool_success(result)
+    assert data["pod"] == "trainer-controller-manager-0"
+    assert data["namespace"] == "kubeflow-system"
+
+
+def _controller_pod(namespace: str) -> MagicMock:
+    pod = MagicMock()
+    pod.metadata.name = "trainer-controller-manager-0"
+    pod.metadata.namespace = namespace
+    pod.status.phase = "Running"
+    return pod
+
+
+def test_inspect_controller_events_response(mock_k8s_apis, scan_default_namespaces):
+    core = mock_k8s_apis["core_v1"]
+    core.list_namespaced_pod.return_value = MagicMock(items=[_controller_pod("kubeflow-system")])
+    event = MagicMock()
+    event.type = "Warning"
+    event.reason = "Failed"
+    event.message = "Training job failed"
+    event.count = 2
+    event.first_timestamp = datetime(2024, 1, 2, 3, 4, 5, tzinfo=timezone.utc)
+    event.last_timestamp = None
+    core.list_namespaced_event.return_value = MagicMock(items=[event])
+    result = inspect_controller(view="events")
+    data = verify_tool_success(result)
+    assert data["pod"] == "trainer-controller-manager-0"
+    assert data["namespace"] == "kubeflow-system"
+    assert data["events"] == [
+        {
+            "type": "Warning",
+            "reason": "Failed",
+            "message": "Training job failed",
+            "count": 2,
+            "first_seen": "2024-01-02T03:04:05+00:00",
+            "last_seen": None,
+        }
+    ]
+    assert data["count"] == 1
+    core.list_namespaced_event.assert_called_once_with(
+        namespace="kubeflow-system",
+        field_selector="involvedObject.name=trainer-controller-manager-0",
+        _request_timeout=mcp_utils.K8S_TIMEOUT,
+    )
+
+
+def test_inspect_controller_rejects_namespace_outside_policy(mock_k8s_apis, tmp_policy_file):
+    tmp_policy_file({"policy": {"namespaces": ["team-a"]}})
+
+    result = inspect_controller(namespace="team-b")
+
+    verify_tool_error(result, error_code=PERMISSION_DENIED)
+    assert not mock_k8s_apis["core_v1"].list_namespaced_pod.called
+
+
+def test_inspect_controller_allows_namespace_in_policy(mock_k8s_apis, tmp_policy_file):
+    tmp_policy_file({"policy": {"namespaces": ["kubeflow-system"]}})
+    core = mock_k8s_apis["core_v1"]
+    core.list_namespaced_pod.return_value = MagicMock(items=[_controller_pod("kubeflow-system")])
+    core.read_namespaced_pod_log.return_value = "controller started"
+
+    result = inspect_controller(namespace="kubeflow-system")
+
+    assert verify_tool_success(result)["namespace"] == "kubeflow-system"
+
+
+def test_inspect_controller_auto_discovery_is_exempt_from_policy(
+    mock_k8s_apis, scan_default_namespaces, tmp_policy_file
+):
+    """Omitting namespace targets the admin-configured controller namespace, not the caller's."""
+    tmp_policy_file({"policy": {"namespaces": ["team-a"]}})
+    core = mock_k8s_apis["core_v1"]
+    core.list_namespaced_pod.return_value = MagicMock(items=[_controller_pod("kubeflow")])
+    core.read_namespaced_pod_log.return_value = "controller started"
+
+    result = inspect_controller()
+
+    assert verify_tool_success(result)["namespace"] == "kubeflow"
+
+
 # Remaining TODOs are outside this PR's runtime CRUD slice.
 # TODO(test): test inspect_crd — lists all Trainer CRDs
 # TODO(test): test inspect_crd(name) — returns CRD schema and conditions
 # TODO(test): test inspect_crd — invalid CRD name
 # TODO(test): test inspect_controller(view="logs") — returns controller logs
-# TODO(test): test inspect_controller(view="events") — returns controller events

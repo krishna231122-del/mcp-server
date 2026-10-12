@@ -18,6 +18,8 @@ Mirrors kubeflow SDK's client structure:
 - TrainerClient from kubeflow.trainer
 """
 
+import logging
+import os
 import threading
 from functools import lru_cache
 from typing import TYPE_CHECKING, Any
@@ -27,6 +29,8 @@ from kubeflow.trainer import TrainerClient
 
 if TYPE_CHECKING:
     from kubernetes import client as k8s_client
+
+logger = logging.getLogger(__name__)
 
 K8S_TIMEOUT = 5
 
@@ -40,7 +44,16 @@ def _get_api_client() -> "k8s_client.ApiClient":
     """
     from kubernetes import client, config
 
-    config.load_config()
+    # Not config.load_config(): it print()s its in-cluster fallback notice to
+    # stdout, the MCP wire under the stdio transport. KUBECONFIG is read here
+    # rather than via config.KUBE_CONFIG_DEFAULT_LOCATION, which is fixed at
+    # import time and treats a path list or an empty value as missing.
+    paths = os.getenv("KUBECONFIG") or "~/.kube/config"
+    if any(os.path.exists(os.path.expanduser(p)) for p in paths.split(os.pathsep) if p):
+        config.load_kube_config(config_file=paths)
+    else:
+        logger.info("No kubeconfig at %s, using in-cluster config", paths)
+        config.load_incluster_config()
     configuration = client.Configuration.get_default_copy()
     configuration.retries = 1
     configuration.socket_options = None  # rely on OS defaults

@@ -15,6 +15,7 @@
 """Tests for the plugin architecture: instruction composition, resource loading,
 persona gating, tool metadata consistency, and tier derivation."""
 
+import inspect
 from dataclasses import dataclass
 from unittest.mock import MagicMock, patch
 
@@ -95,6 +96,36 @@ class TestToolMetadataConsistency:
         assert platform_tools.issubset(tool_names)
 
 
+# ─── Namespace validation ──────────────────────────────────────────────────
+
+# Arguments each tool needs, besides namespace, to get as far as its namespace check.
+_NAMESPACE_TOOL_ARGS = {
+    "fine_tune": {"model": "hf://google/gemma-2b", "dataset": "hf://tatsu-lab/alpaca"},
+    "run_container_training": {"image": "busybox:1.36"},
+    "run_custom_training": {"script": "print('hi')"},
+    "update_training_job": {"name": "job-a", "action": "suspend"},
+}
+_NAMESPACE_TOOLS = [t for t in TOOLS if "namespace" in inspect.signature(t).parameters]
+
+
+@pytest.mark.parametrize("tool", _NAMESPACE_TOOLS, ids=lambda t: t.__name__)
+def test_malformed_namespace_is_rejected_before_any_api_request(tool):
+    """A tool that takes a namespace must not send a malformed one to the API."""
+    params = inspect.signature(tool).parameters
+    args = _NAMESPACE_TOOL_ARGS.get(tool.__name__, {"name": "job-a"} if "name" in params else {})
+
+    with (
+        patch("kubernetes.config.load_kube_config"),
+        patch("kubernetes.config.load_incluster_config"),
+        patch("kubernetes.client.ApiClient.call_api") as call_api,
+    ):
+        result = tool(**args, namespace="Bad_NS!")
+
+    assert result["error_code"] == "VALIDATION_ERROR", result
+    assert "namespace" in result["error"]
+    call_api.assert_not_called()
+
+
 # ─── Persona gating ────────────────────────────────────────────────────────
 
 
@@ -132,6 +163,14 @@ class TestPersonaGating:
     def test_platform_admin_unrestricted(self):
         tools = get_allowed_tools("platform-admin")
         assert tools is None
+
+    def test_persona_inheriting_unrestricted_parent_is_unrestricted(self):
+        with patch(
+            "kubeflow_mcp.core.policy._get_custom_personas_dict",
+            return_value={"cluster-admin": {"inherit": "platform-admin"}},
+        ):
+            tools = get_allowed_tools("cluster-admin")
+            assert tools is None
 
     def test_unknown_persona_raises(self):
         with pytest.raises(ValueError, match="Unknown persona"):
@@ -366,6 +405,28 @@ class TestResourceLoading:
     def test_resource_uris_use_trainer_scheme(self):
         for uri in CLIENT_RESOURCES:
             assert uri.startswith("trainer://"), f"URI '{uri}' should use trainer:// scheme"
+
+    def test_referenced_resource_uris_are_registered(self):
+        """Every trainer:// URI the shipped code points an agent at must resolve.
+
+        Hints and next_steps fire on the failure path, so an unregistered URI
+        breaks resources/read exactly when the agent follows our own advice.
+        """
+        import re
+        from pathlib import Path
+
+        import kubeflow_mcp
+
+        package = Path(kubeflow_mcp.__file__).parent
+        uri_pattern = re.compile(r"trainer://[\w-]+/[\w-]+")
+        sources = [p for p in package.rglob("*.py") if not p.name.endswith("_test.py")]
+        sources += sorted(package.rglob("*.md"))
+
+        for path in sources:
+            for uri in uri_pattern.findall(path.read_text(encoding="utf-8")):
+                assert uri in CLIENT_RESOURCES, (
+                    f"{path.relative_to(package)} references unregistered resource '{uri}'"
+                )
 
     def test_register_resources_with_mock_mcp(self):
         import kubeflow_mcp.trainer as trainer_module

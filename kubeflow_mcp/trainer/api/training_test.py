@@ -18,6 +18,7 @@ from __future__ import annotations
 
 import ast
 import inspect
+import threading
 from unittest.mock import MagicMock, patch
 
 import pytest
@@ -28,9 +29,11 @@ from kubeflow_mcp.trainer.api.training import (
     _forwarded_train_args,
     _has_required_params,
     _has_train_call,
+    _inject_trainer_hf_home,
     _make_train_func,
     _should_apply_hf_dataset_workaround,
     _uncalled_train_call,
+    _validate_resources_per_node,
     fine_tune,
     run_container_training,
     run_custom_training,
@@ -72,7 +75,8 @@ PATCH_GPU_CHECK = "kubeflow_mcp.trainer.api.training._check_gpu_available"
     ],
 )
 def test_fine_tune_validation(test_case):
-    assert_test_case(test_case, fine_tune)
+    with patch(PATCH_GPU_CHECK, return_value=None):
+        assert_test_case(test_case, fine_tune)
 
 
 class TestFineTuneConfirmed:
@@ -205,7 +209,8 @@ class TestFineTuneConfirmed:
         assert result["success"] is False
         assert "GPU" in result["error"]
 
-    def test_non_torchtune_runtime_rejected(self):
+    @patch(PATCH_GPU_CHECK, return_value=None)
+    def test_non_torchtune_runtime_rejected(self, _gpu):
         result = fine_tune(
             model="hf://org/model",
             dataset="hf://org/ds",
@@ -258,6 +263,74 @@ def test_run_custom_training_validation(test_case):
         assert len(result["config"]["safety_warnings"]) > 0
     else:
         assert_test_case(test_case, run_custom_training)
+
+
+@pytest.mark.parametrize(
+    ("tool", "config"),
+    [
+        (run_custom_training, {"script": "print('hello')", "runtime": "torch-distributed"}),
+        (run_container_training, {"image": "pytorch/pytorch:2.0"}),
+        (
+            fine_tune,
+            {
+                "model": "hf://org/model",
+                "dataset": "hf://org/dataset",
+                "runtime": "torchtune-llama",
+            },
+        ),
+    ],
+)
+@pytest.mark.parametrize(
+    "bad_resources",
+    [
+        {"cpu": "4cores"},
+        {"memory": "256MB"},
+        {"gpu": -1},
+        {"gpu": "two"},
+        {"gpu": 1.5},
+        {"cpu": ""},
+        {"memory": None},
+        {"amd.com/gpu": "lots"},
+        {},
+        ["gpu", 1],
+    ],
+)
+def test_training_tools_reject_invalid_resources_before_sdk_call(tool, config, bad_resources):
+    with patch(PATCH_CLIENT) as mock_client:
+        result = tool(**config, resources_per_node=bad_resources, confirmed=True)
+
+    assert result["success"] is False
+    assert result["error_code"] == VALIDATION_ERROR
+    mock_client.assert_not_called()
+
+
+@pytest.mark.parametrize(
+    "resources",
+    [
+        {"cpu": 8},
+        {"cpu": 0.5},
+        {"cpu": "500m"},
+        {"memory": "10G"},
+        {"memory": "1.5Gi"},
+        {"gpu": 2},
+        {"amd.com/gpu": 2},
+    ],
+)
+def test_validate_resources_per_node_accepts_kubernetes_quantities(resources):
+    assert _validate_resources_per_node(resources) is None
+
+
+def test_fine_tune_validates_resources_before_gpu_preflight():
+    with patch(PATCH_GPU_CHECK) as gpu_check:
+        result = fine_tune(
+            model="hf://org/model",
+            dataset="hf://org/dataset",
+            runtime="torchtune-llama",
+            resources_per_node={"cpu": "4cores"},
+        )
+
+    assert result["error_code"] == VALIDATION_ERROR
+    gpu_check.assert_not_called()
 
 
 class TestRunCustomTrainingConfirmed:
@@ -555,3 +628,89 @@ def test_build_fine_tune_config_masks_secrets():
     assert config["hf_token"] == "***"
     assert config["s3_access_key_id"] == "***"
     assert config["s3_secret_access_key"] == "***"
+
+
+def test_inject_trainer_hf_home_concurrent_isolation():
+    """Verify concurrent _inject_trainer_hf_home calls maintain context isolation and restore original function."""
+    import kubeflow.trainer.backends.kubernetes.utils as k8s_utils
+    from kubeflow.trainer.types import types as sdk_types
+
+    original_func = k8s_utils.get_trainer_cr_from_builtin_trainer
+    runtime_trainer = sdk_types.RuntimeTrainer(
+        trainer_type=sdk_types.TrainerType.BUILTIN_TRAINER,
+        framework="torchtune",
+        image="test:latest",
+    )
+    runtime_trainer.set_command(("torchrun",))
+    runtime = sdk_types.Runtime(
+        name="test-rt",
+        trainer=runtime_trainer,
+        kind=sdk_types.RuntimeKind.CLUSTER_TRAINING_RUNTIME,
+    )
+    builtin = sdk_types.BuiltinTrainer(config=sdk_types.TorchTuneConfig(batch_size=4, epochs=1))
+
+    barrier = threading.Barrier(4)
+    errors: list[str] = []
+    completed: list[int | str] = []
+
+    def worker(worker_id: int) -> None:
+        try:
+            target_path = f"/workspace/.hf_{worker_id}"
+            with _inject_trainer_hf_home(target_path):
+                barrier.wait(timeout=5.0)
+                cr = k8s_utils.get_trainer_cr_from_builtin_trainer(runtime, builtin)
+                if cr.env is None:
+                    errors.append(f"Worker {worker_id}: cr.env is None")
+                    return
+                hf_env = next((e for e in cr.env if e.name == "HF_HOME"), None)
+                if not hf_env or hf_env.value != target_path:
+                    errors.append(f"Worker {worker_id}: expected {target_path}, got {hf_env}")
+                    return
+                completed.append(worker_id)
+        except Exception as exc:
+            errors.append(f"Worker {worker_id} raised: {exc!r}")
+
+    def uninjected_worker() -> None:
+        try:
+            barrier.wait(timeout=5.0)
+            cr = k8s_utils.get_trainer_cr_from_builtin_trainer(runtime, builtin)
+            if cr.env is not None and any(e.name == "HF_HOME" for e in cr.env):
+                errors.append("Uninjected worker unexpectedly got HF_HOME")
+                return
+            completed.append("uninjected")
+        except Exception as exc:
+            errors.append(f"Uninjected worker raised: {exc!r}")
+
+    threads = [
+        threading.Thread(target=worker, args=(1,)),
+        threading.Thread(target=worker, args=(2,)),
+        threading.Thread(target=worker, args=(3,)),
+        threading.Thread(target=uninjected_worker),
+    ]
+
+    for t in threads:
+        t.start()
+    for t in threads:
+        t.join(timeout=10.0)
+        assert not t.is_alive(), "Worker thread timed out"
+
+    assert not errors, f"Concurrency errors encountered: {errors}"
+    assert len(completed) == 4, f"Expected 4 completed workers, got {len(completed)}"
+    assert k8s_utils.get_trainer_cr_from_builtin_trainer is original_func, (
+        "Monkey-patch function identity was not restored to original"
+    )
+
+
+def test_inject_trainer_hf_home_exception_handling():
+    """Verify refcount and monkey-patch cleanly revert if an exception occurs within yield."""
+    import kubeflow.trainer.backends.kubernetes.utils as k8s_utils
+
+    original_func = k8s_utils.get_trainer_cr_from_builtin_trainer
+    with pytest.raises(RuntimeError, match="simulated failure"):
+        with _inject_trainer_hf_home("/workspace/.hf_err"):
+            assert k8s_utils.get_trainer_cr_from_builtin_trainer is not original_func
+            raise RuntimeError("simulated failure")
+
+    assert k8s_utils.get_trainer_cr_from_builtin_trainer is original_func, (
+        "Monkey-patch function identity was not restored after exception"
+    )

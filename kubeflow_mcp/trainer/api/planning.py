@@ -19,6 +19,7 @@ import re
 from typing import Any
 
 from kubeflow_mcp.common.constants import (
+    KUBEFLOW_SDK_VERSION_SPEC,
     MIN_K8S_VERSION,
     MIN_TRAINER_CRD_VERSION,
     TRAINER_CRD_NAME,
@@ -70,17 +71,26 @@ def _suggest_hf_model_ids(model: str, limit: int = 3) -> list[str]:
 
 
 def _get_model_info_from_hf(model: str) -> dict[str, Any] | None:
-    """Fetch model info from HuggingFace Hub."""
+    """Fetch model info from HuggingFace Hub.
+
+    Errors known to be caused by the model ID itself carry ``kind``: ``"format"``
+    for a malformed ID, ``"not_found"`` for a repo the Hub confirms missing with a
+    404. Every other failure has no ``kind``, including a 401, which the Hub
+    returns both for a missing repo requested anonymously and for a private repo.
+    """
     try:
         if not _HF_MODEL_ID_RE.match(model):
-            result: dict[str, Any] = {"error": f"Invalid HuggingFace model ID format: '{model}'"}
+            result: dict[str, Any] = {
+                "error": f"Invalid HuggingFace model ID format: '{model}'",
+                "kind": "format",
+            }
             suggestions = _suggest_hf_model_ids(model)
             if suggestions:
                 result["suggestions"] = suggestions
             return result
 
         from huggingface_hub import model_info
-        from huggingface_hub.errors import RepositoryNotFoundError
+        from huggingface_hub.errors import GatedRepoError, RepositoryNotFoundError
 
         try:
             info = model_info(model, timeout=10)
@@ -90,6 +100,14 @@ def _get_model_info_from_hf(model: str) -> dict[str, Any] | None:
             # Other failures (auth, rate-limit, network, metadata) fall through
             # to the outer handler unchanged, with no extra Hub request.
             not_found: dict[str, Any] = {"error": str(e)}
+            # The Hub raises this error for private or gated repos and missing
+            # auth too (401, GatedRepoError), and a 401 is ambiguous: an anonymous
+            # request gets it for a missing repo as well. Only a plain 404 is
+            # treated as a nonexistent repo, so an access failure is never
+            # reported as bad input.
+            status_code = getattr(getattr(e, "response", None), "status_code", None)
+            if status_code == 404 and not isinstance(e, GatedRepoError):
+                not_found["kind"] = "not_found"
             suggestions = _suggest_hf_model_ids(model)
             if suggestions:
                 not_found["suggestions"] = suggestions
@@ -276,33 +294,31 @@ def _check_trainer_crd(
 
 
 def _check_sdk_version(checks: dict[str, dict[str, Any]], blockers: list[str]) -> None:
-    """Check kubeflow-trainer package is installed and meets minimum version."""
+    """Check kubeflow package is installed within the supported SDK range."""
     import importlib.metadata
 
     try:
-        sdk_version = importlib.metadata.version("kubeflow-trainer")
+        sdk_version = importlib.metadata.version("kubeflow")
+        from packaging.specifiers import SpecifierSet
         from packaging.version import Version
 
-        sdk_min = "0.4.0"
-        sdk_ok = Version(sdk_version) >= Version(sdk_min)
+        spec = SpecifierSet(KUBEFLOW_SDK_VERSION_SPEC)
+        sdk_ok = Version(sdk_version) in spec
         checks["kubeflow_sdk"] = {
             "status": "pass" if sdk_ok else "fail",
             "version": sdk_version,
-            "minimum": sdk_min,
+            "required": KUBEFLOW_SDK_VERSION_SPEC,
         }
         if not sdk_ok:
-            blockers.append(f"kubeflow-trainer {sdk_version} is below minimum {sdk_min}")
+            blockers.append(
+                f"kubeflow {sdk_version} is installed; kubeflow-mcp requires "
+                f"kubeflow{KUBEFLOW_SDK_VERSION_SPEC}"
+            )
     except importlib.metadata.PackageNotFoundError:
-        try:
-            sdk_version = importlib.metadata.version("kubeflow")
-            checks["kubeflow_sdk"] = {
-                "status": "pass",
-                "version": sdk_version,
-                "package": "kubeflow",
-            }
-        except importlib.metadata.PackageNotFoundError:
-            checks["kubeflow_sdk"] = {"status": "fail", "error": "Not installed"}
-            blockers.append("kubeflow-trainer not installed (pip install kubeflow-trainer)")
+        checks["kubeflow_sdk"] = {"status": "fail", "error": "Not installed"}
+        blockers.append(
+            f'kubeflow not installed (pip install "kubeflow{KUBEFLOW_SDK_VERSION_SPEC}")'
+        )
     except ImportError:
         checks["kubeflow_sdk"] = {
             "status": "warn",
@@ -353,7 +369,7 @@ def check_compatibility() -> dict[str, Any]:
         1. **Kubernetes version** — minimum {min_k8s} required
         2. **Trainer CRD installed** — ``trainjobs.trainer.kubeflow.org`` must exist
         3. **CRD API version** — ``{crd_version}`` must be served
-        4. **Kubeflow training package** — minimum ``0.4.0`` required
+        4. **Kubeflow SDK** — ``{sdk_version}`` required
         5. **Platform detection** — identifies platform from node labels
 
     Returns:
@@ -369,7 +385,9 @@ def check_compatibility() -> dict[str, Any]:
         >>> check_compatibility()
         {{"data": {{"compatible": true, "checks": {{...}}, "platform": "kubernetes"}}}}
     """.format(
-        min_k8s=f"{MIN_K8S_VERSION[0]}.{MIN_K8S_VERSION[1]}", crd_version=MIN_TRAINER_CRD_VERSION
+        min_k8s=f"{MIN_K8S_VERSION[0]}.{MIN_K8S_VERSION[1]}",
+        crd_version=MIN_TRAINER_CRD_VERSION,
+        sdk_version=KUBEFLOW_SDK_VERSION_SPEC,
     )
     try:
         from kubeflow_mcp.common.utils import (
@@ -537,9 +555,13 @@ def estimate_resources(
             # caller (and pre_flight, which delegates here) can self-correct.
             if hf_info and hf_info.get("suggestions"):
                 details["suggestions"] = hf_info["suggestions"]
+            # A malformed model ID, or one the Hub confirms missing (404), is an
+            # input error, not a backend/network problem — use VALIDATION_ERROR so
+            # agents fix the input instead of retrying the same bad request.
+            is_input_error = bool(hf_info) and hf_info.get("kind") in ("format", "not_found")
             return ToolError(
                 error=f"Could not fetch model info from HuggingFace: {error_msg}",
-                error_code=ErrorCode.SDK_ERROR,
+                error_code=ErrorCode.VALIDATION_ERROR if is_input_error else ErrorCode.SDK_ERROR,
                 details=details,
             ).model_dump()
 
