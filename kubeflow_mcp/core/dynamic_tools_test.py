@@ -48,6 +48,140 @@ def _registry():
     dynamic_tools._embedding_cache.reset()
 
 
+@pytest.fixture
+def offline_model(monkeypatch):
+    """sentence-transformers is installed, but the model download fails."""
+    import sys
+    from types import SimpleNamespace
+
+    load_attempts = []
+
+    def load_model(*_args, **_kwargs):
+        load_attempts.append(1)
+        raise OSError("We couldn't connect to 'https://huggingface.co' to load this model")
+
+    monkeypatch.setitem(
+        sys.modules, "sentence_transformers", SimpleNamespace(SentenceTransformer=load_model)
+    )
+    dynamic_tools._embedding_cache.reset()
+    yield load_attempts
+    dynamic_tools._embedding_cache.reset()
+
+
+def test_find_tools_falls_back_to_keywords_when_model_cannot_load(offline_model):
+    result = dynamic_tools.find_tools("probe tool")
+
+    assert result["mode"] == "keyword_fallback"
+    assert result["tools"][0]["name"] == "probe_tool"
+
+
+@pytest.fixture
+def model_that_cannot_encode(monkeypatch):
+    """The model loads, but encoding the tool descriptions fails."""
+    import sys
+    from types import SimpleNamespace
+
+    class _Model:
+        def encode(self, *_args, **_kwargs):
+            raise RuntimeError("CUDA error: no kernel image is available")
+
+    monkeypatch.setitem(
+        sys.modules,
+        "sentence_transformers",
+        SimpleNamespace(SentenceTransformer=lambda *_a, **_k: _Model()),
+    )
+    dynamic_tools._embedding_cache.reset()
+    yield
+    dynamic_tools._embedding_cache.reset()
+
+
+def test_find_tools_falls_back_when_the_model_cannot_encode(model_that_cannot_encode):
+    result = dynamic_tools.find_tools("probe tool")
+
+    assert result["mode"] == "keyword_fallback"
+    assert result["tools"][0]["name"] == "probe_tool"
+
+
+def test_find_tools_does_not_retry_failed_model_load(offline_model):
+    for _ in range(3):
+        dynamic_tools.find_tools("probe tool")
+
+    assert len(offline_model) == 1
+
+
+def test_embedding_cache_reset_retries_model_load(offline_model):
+    dynamic_tools.find_tools("probe tool")
+    dynamic_tools._embedding_cache.reset()
+    dynamic_tools.find_tools("probe tool")
+
+    assert len(offline_model) == 2
+
+
+@pytest.fixture
+def broken_native_dependency(monkeypatch):
+    """The package is installed, but importing from it fails."""
+    import sys
+
+    class _BrokenModule:
+        def __getattr__(self, name):
+            raise OSError("libtorch_cpu.so: cannot open shared object file")
+
+    monkeypatch.setitem(sys.modules, "sentence_transformers", _BrokenModule())
+    dynamic_tools._embedding_cache.reset()
+    yield
+    dynamic_tools._embedding_cache.reset()
+
+
+def test_find_tools_falls_back_when_the_import_is_broken(broken_native_dependency):
+    result = dynamic_tools.find_tools("probe tool")
+
+    assert result["mode"] == "keyword_fallback"
+    assert result["tools"][0]["name"] == "probe_tool"
+
+
+def test_init_dynamic_tools_lets_the_model_be_retried(offline_model):
+    dynamic_tools.find_tools("probe tool")
+    assert len(offline_model) == 1
+
+    dynamic_tools.init_dynamic_tools([probe_tool, failing_tool], {})
+    dynamic_tools.find_tools("probe tool")
+
+    assert len(offline_model) == 2
+
+
+@pytest.fixture
+def slow_offline_model(monkeypatch):
+    """Loading takes a moment before it fails, so threads overlap inside the load."""
+    import sys
+    import time
+    from types import SimpleNamespace
+
+    load_attempts = []
+
+    def load_model(*_args, **_kwargs):
+        load_attempts.append(1)
+        time.sleep(0.05)
+        raise OSError("We couldn't connect to 'https://huggingface.co' to load this model")
+
+    monkeypatch.setitem(
+        sys.modules, "sentence_transformers", SimpleNamespace(SentenceTransformer=load_model)
+    )
+    dynamic_tools._embedding_cache.reset()
+    yield load_attempts
+    dynamic_tools._embedding_cache.reset()
+
+
+def test_concurrent_find_tools_loads_the_model_once(slow_offline_model):
+    from concurrent.futures import ThreadPoolExecutor
+
+    with ThreadPoolExecutor(max_workers=8) as pool:
+        futures = [pool.submit(dynamic_tools.find_tools, "probe tool") for _ in range(8)]
+        results = [f.result() for f in futures]
+
+    assert all(result["mode"] == "keyword_fallback" for result in results)
+    assert len(slow_offline_model) == 1
+
+
 @pytest.mark.parametrize(
     "arguments",
     [

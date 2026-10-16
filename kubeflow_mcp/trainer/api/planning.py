@@ -71,17 +71,26 @@ def _suggest_hf_model_ids(model: str, limit: int = 3) -> list[str]:
 
 
 def _get_model_info_from_hf(model: str) -> dict[str, Any] | None:
-    """Fetch model info from HuggingFace Hub."""
+    """Fetch model info from HuggingFace Hub.
+
+    Errors known to be caused by the model ID itself carry ``kind``: ``"format"``
+    for a malformed ID, ``"not_found"`` for a repo the Hub confirms missing with a
+    404. Every other failure has no ``kind``, including a 401, which the Hub
+    returns both for a missing repo requested anonymously and for a private repo.
+    """
     try:
         if not _HF_MODEL_ID_RE.match(model):
-            result: dict[str, Any] = {"error": f"Invalid HuggingFace model ID format: '{model}'"}
+            result: dict[str, Any] = {
+                "error": f"Invalid HuggingFace model ID format: '{model}'",
+                "kind": "format",
+            }
             suggestions = _suggest_hf_model_ids(model)
             if suggestions:
                 result["suggestions"] = suggestions
             return result
 
         from huggingface_hub import model_info
-        from huggingface_hub.errors import RepositoryNotFoundError
+        from huggingface_hub.errors import GatedRepoError, RepositoryNotFoundError
 
         try:
             info = model_info(model, timeout=10)
@@ -91,6 +100,14 @@ def _get_model_info_from_hf(model: str) -> dict[str, Any] | None:
             # Other failures (auth, rate-limit, network, metadata) fall through
             # to the outer handler unchanged, with no extra Hub request.
             not_found: dict[str, Any] = {"error": str(e)}
+            # The Hub raises this error for private or gated repos and missing
+            # auth too (401, GatedRepoError), and a 401 is ambiguous: an anonymous
+            # request gets it for a missing repo as well. Only a plain 404 is
+            # treated as a nonexistent repo, so an access failure is never
+            # reported as bad input.
+            status_code = getattr(getattr(e, "response", None), "status_code", None)
+            if status_code == 404 and not isinstance(e, GatedRepoError):
+                not_found["kind"] = "not_found"
             suggestions = _suggest_hf_model_ids(model)
             if suggestions:
                 not_found["suggestions"] = suggestions
@@ -538,9 +555,13 @@ def estimate_resources(
             # caller (and pre_flight, which delegates here) can self-correct.
             if hf_info and hf_info.get("suggestions"):
                 details["suggestions"] = hf_info["suggestions"]
+            # A malformed model ID, or one the Hub confirms missing (404), is an
+            # input error, not a backend/network problem — use VALIDATION_ERROR so
+            # agents fix the input instead of retrying the same bad request.
+            is_input_error = bool(hf_info) and hf_info.get("kind") in ("format", "not_found")
             return ToolError(
                 error=f"Could not fetch model info from HuggingFace: {error_msg}",
-                error_code=ErrorCode.SDK_ERROR,
+                error_code=ErrorCode.VALIDATION_ERROR if is_input_error else ErrorCode.SDK_ERROR,
                 details=details,
             ).model_dump()
 

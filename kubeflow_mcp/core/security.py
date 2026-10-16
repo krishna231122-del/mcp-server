@@ -102,7 +102,11 @@ def validate_namespace(namespace: str) -> ToolError | None:
 
 
 def check_namespace_allowed(namespace: str | None) -> ToolError | None:
-    """Check if namespace is allowed by policy.
+    """Check that a namespace is well formed and allowed by policy.
+
+    A caller-supplied namespace is format-checked first. Without an allowlist
+    the policy check accepts any string, so a malformed value would otherwise
+    reach the Kubernetes API and come back as a misleading "not found".
 
     When *namespace* is ``None`` the effective default namespace from the
     TrainerClient backend is resolved and checked against the allowlist so
@@ -112,8 +116,13 @@ def check_namespace_allowed(namespace: str | None) -> ToolError | None:
         namespace: Namespace to check. ``None`` resolves to the effective default.
 
     Returns:
-        ToolError if namespace is restricted, None if allowed
+        ToolError if namespace is malformed or restricted, None if allowed
     """
+    if namespace is not None:
+        format_err = validate_namespace(namespace)
+        if format_err is not None:
+            return format_err
+
     # Import here to avoid circular import
     from kubeflow_mcp.core.policy import get_allowed_namespaces
 
@@ -182,8 +191,17 @@ class _ScriptSafetyVisitor(ast.NodeVisitor):
         self.warnings: list[str] = []
 
     def visit_Call(self, node: ast.Call) -> None:  # noqa: N802
-        if isinstance(node.func, ast.Name) and node.func.id in _DANGEROUS_CALLS:
-            self.warnings.append(f"Dangerous call: {node.func.id}() at line {node.lineno}")
+        if isinstance(node.func, ast.Name):
+            if node.func.id in _DANGEROUS_CALLS:
+                self.warnings.append(f"Dangerous call: {node.func.id}() at line {node.lineno}")
+            elif node.func.id in {"getattr", "setattr", "delattr"}:
+                if len(node.args) >= 2:
+                    attr_arg = node.args[1]
+                    if isinstance(attr_arg, ast.Constant) and isinstance(attr_arg.value, str):
+                        if attr_arg.value in _DANGEROUS_DUNDER:
+                            self.warnings.append(
+                                f"Dangerous call: {node.func.id}() at line {node.lineno}"
+                            )
         elif isinstance(node.func, ast.Attribute):
             if isinstance(node.func.value, ast.Name):
                 module = node.func.value.id
@@ -212,6 +230,11 @@ class _ScriptSafetyVisitor(ast.NodeVisitor):
             self.warnings.append(f"Dangerous attribute access: {node.attr} at line {node.lineno}")
         self.generic_visit(node)
 
+    def visit_Name(self, node: ast.Name) -> None:  # noqa: N802
+        if node.id in _DANGEROUS_DUNDER:
+            self.warnings.append(f"Dangerous name access: {node.id} at line {node.lineno}")
+        self.generic_visit(node)
+
 
 def is_safe_python_code(code: str) -> tuple[bool, str]:
     """AST-based scan for dangerous patterns in training scripts.
@@ -225,7 +248,8 @@ def is_safe_python_code(code: str) -> tuple[bool, str]:
 
     **Flagged patterns** (via AST, not substring matching):
 
-    - Calls: ``eval``, ``exec``, ``compile``, ``__import__``
+    - Calls: ``eval``, ``exec``, ``compile``, ``__import__``; ``getattr``/``setattr``/``delattr``
+      only when the attribute name is a literal dangerous dunder (e.g. ``"__globals__"``)
     - Module calls: ``os.system``, ``os.popen``, ``subprocess.*``, ``shutil.rmtree``
     - Imports: ``ctypes``, ``socket``
     - Dunder access: ``__builtins__``, ``__subclasses__``, ``__globals__``, ``__code__``
