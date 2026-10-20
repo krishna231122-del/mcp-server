@@ -1,4 +1,4 @@
-"""KServe Kubernetes client wrapper for kubeflow_mcp."""
+"""KServe Kubernetes client wrapper for kubeflow_mcp server ."""
 
 from typing import Any
 
