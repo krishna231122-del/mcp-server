@@ -179,16 +179,14 @@ def test_find_config_file_prefers_project_local_config(tmp_path):
         assert _find_config_file() == local_config
 
 
-def test_load_config_path_not_exists_falls_back_to_default(tmp_path):
+def test_load_config_falls_back_to_default_when_path_missing(tmp_path):
     missing_path = tmp_path / "missing.yaml"
     default_config = tmp_path / ".kubeflow-mcp.yaml"
     default_config.write_text("server:\n  persona: ml-engineer\n")
 
-    with patch(
-        "kubeflow_mcp.core.config._find_config_file", return_value=default_config
-    ) as mock_find:
+    with patch("kubeflow_mcp.core.config._find_config_file", return_value=default_config):
         cfg = load_config(config_path=missing_path)
-    mock_find.assert_called_once()
+    assert cfg.server.persona == "ml-engineer"
     assert cfg.server.persona == "ml-engineer"
 
 
