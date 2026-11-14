@@ -86,6 +86,9 @@ PERSONAS: dict[str, dict[str, Any]] = {
             "get_training_events",
             "health_check",
             "get_server_logs",
+            "list_inference_services",
+            "get_inference_service",
+            "get_inference_logs",
         ]
     },
     "data-scientist": {
@@ -95,6 +98,8 @@ PERSONAS: dict[str, dict[str, Any]] = {
             "run_custom_training",
             "wait_for_training",
             "delete_training_job",
+            "deploy_model",
+            "delete_inference_service",
         ],
     },
     "ml-engineer": {
@@ -109,7 +114,7 @@ PERSONAS: dict[str, dict[str, Any]] = {
     "platform-admin": {"tools": "*"},
 }
 
-DESTRUCTIVE_TOOLS = {"delete_training_job", "delete_runtime"}
+DESTRUCTIVE_TOOLS = {"delete_training_job", "delete_runtime", "delete_inference_service"}
 
 # ─── Runtime persona ───────────────────────
 # Set once at server startup by create_server(); tools read via get_effective_persona().

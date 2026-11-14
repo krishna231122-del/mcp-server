@@ -112,10 +112,22 @@ TOOL_PHASES: dict[str, list[str]] = {
         "get_training_job",
         "list_runtimes",
         "get_runtime",
+        "list_inference_services",
+        "get_inference_service",
     ],
     "training": ["fine_tune", "run_custom_training", "run_container_training"],
-    "monitoring": ["get_training_logs", "get_training_events", "wait_for_training"],
-    "lifecycle": ["delete_training_job", "update_training_job"],
+    "monitoring": [
+        "get_training_logs",
+        "get_training_events",
+        "wait_for_training",
+        "get_inference_logs",
+    ],
+    "lifecycle": [
+        "delete_training_job",
+        "update_training_job",
+        "deploy_model",
+        "delete_inference_service",
+    ],
     "platform": [
         "inspect_crd",
         "inspect_controller",
@@ -182,6 +194,11 @@ TOOL_NEXT_HINTS: dict[str, str] = {
     "patch_runtime": "Verify changes with get_runtime(name)",
     "create_runtime": "Verify with list_runtimes() or get_runtime(name)",
     "delete_runtime": "Confirm removal with list_runtimes()",
+    "list_inference_services": "Call get_inference_service(name) for details or get_inference_logs(name) for logs",
+    "get_inference_service": "Use get_inference_logs(name) to debug or send inference requests to url",
+    "get_inference_logs": "Check inference service status or resubmit deployment if needed",
+    "deploy_model": "Monitor rollout with get_inference_service(name) and get_inference_logs(name)",
+    "delete_inference_service": "Verify deletion with list_inference_services()",
 }
 
 
@@ -225,6 +242,17 @@ SDK_COMPATIBILITY: dict[str, object] = {
             "status": "stub",
             "sdk_client": "model_registry.ModelRegistry",
             "covered_methods": [],
+        },
+        "serving": {
+            "status": "implemented",
+            "sdk_client": "kubeflow_mcp.serving.client.KServeClient",
+            "covered_methods": [
+                "list_inference_services",
+                "get_inference_service",
+                "create_inference_service",
+                "delete_inference_service",
+                "get_predictor_logs",
+            ],
         },
         "pipelines": {
             "status": "planned",

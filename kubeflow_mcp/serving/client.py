@@ -1,4 +1,18 @@
-"""KServe Kubernetes client wrapper for kubeflow_mcp server ."""
+# Copyright The Kubeflow Authors
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
+"""KServe Kubernetes client wrapper for kubeflow_mcp server."""
 
 from typing import Any
 
@@ -13,14 +27,30 @@ PLURAL = "inferenceservices"
 class KServeClient:
     """Client for managing KServe InferenceService CRDs."""
 
-    def __init__(self, kubeconfig_path: str | None = None):
-        try:
-            config.load_incluster_config()
-        except config.ConfigException:
-            config.load_kube_config(config_file=kubeconfig_path)
+    def __init__(
+        self,
+        kubeconfig_path: str | None = None,
+        custom_api: Any | None = None,
+        core_api: Any | None = None,
+    ):
+        if custom_api is not None and core_api is not None:
+            self.custom_api = custom_api
+            self.core_api = core_api
+            return
 
-        self.custom_api = client.CustomObjectsApi()
-        self.core_api = client.CoreV1Api()
+        try:
+            from kubeflow_mcp.common.utils import get_core_v1_api, get_custom_objects_api
+
+            self.custom_api = custom_api or get_custom_objects_api()
+            self.core_api = core_api or get_core_v1_api()
+        except Exception:
+            try:
+                config.load_incluster_config()
+            except config.ConfigException:
+                config.load_kube_config(config_file=kubeconfig_path)
+
+            self.custom_api = custom_api or client.CustomObjectsApi()
+            self.core_api = core_api or client.CoreV1Api()
 
     def list_inference_services(self, namespace: str = "default") -> list[dict[str, Any]]:
         """List all InferenceServices in a namespace."""
@@ -62,6 +92,16 @@ class KServeClient:
             namespace=namespace,
             plural=PLURAL,
             body=manifest,
+        )
+
+    def delete_inference_service(self, name: str, namespace: str = "default") -> dict[str, Any]:
+        """Delete an InferenceService."""
+        return self.custom_api.delete_namespaced_custom_object(
+            group=GROUP,
+            version=VERSION,
+            namespace=namespace,
+            plural=PLURAL,
+            name=name,
         )
 
     @staticmethod

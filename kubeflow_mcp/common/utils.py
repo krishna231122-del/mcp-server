@@ -157,6 +157,18 @@ _TRAINJOB_GROUP = "trainer.kubeflow.org"
 _TRAINJOB_VERSION = "v1alpha1"
 _TRAINJOB_PLURAL = "trainjobs"
 
+_KSERVE_GROUP = "serving.kserve.io"
+_KSERVE_VERSION = "v1beta1"
+_KSERVE_PLURAL = "inferenceservices"
+
+
+@lru_cache(maxsize=1)
+def get_kserve_client() -> Any:
+    """Get or create KServeClient singleton."""
+    from kubeflow_mcp.serving.client import KServeClient
+
+    return KServeClient()
+
 
 # Outcomes of an ownership check. "missing" is kept distinct from "unmanaged"
 # because the two need opposite responses: a job that does not exist is a
@@ -197,9 +209,40 @@ def get_trainer_ownership(name: str, namespace: str) -> str | None:
         return None
 
 
+def get_kserve_ownership(name: str, namespace: str) -> str | None:
+    """Classify an InferenceService for the MCP ownership gate.
+
+    Returns:
+        ``OWNERSHIP_MANAGED`` if the service carries the MCP ownership label,
+        ``OWNERSHIP_UNMANAGED`` if it exists without the label,
+        ``OWNERSHIP_MISSING`` if no such service exists, or
+        ``None`` if the check could not be performed (API error, permissions).
+    """
+    try:
+        api = get_custom_objects_api()
+        obj = api.get_namespaced_custom_object(
+            group=_KSERVE_GROUP,
+            version=_KSERVE_VERSION,
+            namespace=namespace,
+            plural=_KSERVE_PLURAL,
+            name=name,
+            _request_timeout=K8S_TIMEOUT,
+        )
+        labels = obj.get("metadata", {}).get("labels", {})
+        managed = labels.get(MCP_MANAGED_LABEL) == MCP_MANAGED_VALUE
+        return OWNERSHIP_MANAGED if managed else OWNERSHIP_UNMANAGED
+    except Exception as e:
+        from kubeflow_mcp.common.types import is_k8s_not_found
+
+        if is_k8s_not_found(e):
+            return OWNERSHIP_MISSING
+        return None
+
+
 def reset_clients() -> None:
     """Reset all cached clients (for testing or kubeconfig rotation)."""
     get_trainer_client.cache_clear()
+    get_kserve_client.cache_clear()
     _get_api_client.cache_clear()
     with _ns_client_lock:
         _ns_client_cache.clear()
